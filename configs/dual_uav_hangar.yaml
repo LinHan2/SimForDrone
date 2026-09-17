@@ -1,0 +1,38 @@
+# SimForDrone 双机 Warehouse 场景超参数。修改后必须重启 Isaac 场景才会生效。
+# 可用 SIMFORDRONE_CONFIG=/absolute/path/experiment.yaml 切换到另一组实验参数。
+
+px4:
+  # Pegasus 中 PX4 归一化执行器输出到转子角速度的增益；环境变量可单次覆盖它。
+  rotor_input_scaling: 2000.0
+
+vehicles:
+  target:
+    vehicle_id: 0
+    stage_path: /World/target_uav
+    initial_position: [3.0, 0.0, 2.0]
+    ros_namespace: target_uav_
+  tracker:
+    vehicle_id: 1
+    stage_path: /World/tracker_uav
+    initial_position: [-3.0, 0.0, 2.0]
+    ros_namespace: tracker_uav_
+
+observer_camera:
+  name: front_camera
+  depth: true
+  position: [0.30, 0.0, 0.0]
+  orientation_deg: [0.0, 0.0, 180.0]
+  resolution: [1280, 720]
+  frequency_hz: 30.0
+  intrinsics: [[640.0, 0.0, 640.0], [0.0, 640.0, 360.0], [0.0, 0.0, 1.0]]
+  diagonal_fov_deg: 100.0
+
+viewport:
+  position: [10.0, -10.0, 7.0]
+  target: [0.0, 0.0, 1.5]
+
+environment:
+  # 官方 Isaac Sim 5.1 Full Warehouse：真实货架、叉车、工业材质及预制灯光。
+  # 已于 2026-09-17 验证 HTTP 200；首次场景加载会下载并缓存其依赖。
+  asset_url: https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/Isaac/Environments/Simple_Warehouse/full_warehouse.usd
+  prim_path: /World/layout
