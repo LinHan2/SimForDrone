@@ -1,0 +1,93 @@
+# px4ctrl 仿真参数（Isaac Sim + Pegasus + PX4 SITL）。
+# 与 real.yaml 的唯一结构性差异是 link 段：控制器与状态机对两侧完全一致。
+
+mass: 1.0            # kg，仅用于记录/在线推力估计；控制律本身使用归一化推力
+gra: 9.81
+ctrl_freq_max: 100.0 # 控制周期上限；实际下发频率由 CLI 的 --rate-hz 决定（必须 >2 Hz）
+use_bodyrate_ctrl: false
+max_angle: 25.0      # 倾角限幅（度）；负值表示不限制
+max_manual_vel: 2.5
+
+auto_takeoff_land:
+  enable: true
+  enable_auto_arm: true
+  no_rc: true        # 仿真没有遥控器
+  takeoff_height: 2.0
+  takeoff_land_speed: 0.5
+
+thrust_model:
+  print_value: false
+  accurate_thrust_model: true
+  K1: 0.7583
+  K2: 1.6942
+  K3: 0.6786
+  # ---- 已标定值，直接复用，不要每次重跑标定 ----
+  # 本控制律中 thrust = des_a_z / thr2acc，而 thr2acc = gra / hover_percentage，
+  # 因此**悬停时的推力指令恰好等于该值**，它是控制器唯一的推力标定量。
+  #
+  # 来源（可追溯）：
+  #   方法    position 模式悬停，取稳定段 SERVO_OUTPUT_RAW 的均值
+  #   日期    2026-09-18
+  #   证据    logs/px4ctrl/measure-hover-target-20260918-161202/run.json
+  #   样本    124 个（高度进入目标 ±0.3 m 且垂速 < 0.15 m/s）
+  #   复测    python -m px4ctrl.cli measure-hover --role target --execute
+  #
+  # 注意与场景侧的区别：configs/dual_uav_hangar.yaml 的 rotor_input_scaling
+  # （=2000，Pegasus 的 PX4 输出→转子转速增益）是**被控对象**的标定，
+  # 与本值（控制器的推力模型）是两层不同的量，不可互相替代。
+  hover_percentage: 0.2893
+
+gain:
+  # 与上游 ctrl_param_fpv.yaml 同名字段，便于对照调参。
+  Kp0: 6.0
+  Kp1: 6.0
+  Kp2: 5.0
+  Kv0: 4.0
+  Kv1: 4.0
+  Kv2: 5.0
+  KAngR: 20.0
+  KAngP: 20.0
+  KAngY: 20.0
+
+msg_timeout:
+  odom: 0.5
+  rc: 0.5
+  cmd: 0.5
+  imu: 0.5
+  bat: 0.5
+
+link:
+  # 留空表示使用 vehicle.py 中该角色的仿真端点（target=14540 / tracker=14541）。
+  connection: ""
+  target_system: 0   # 0 表示沿用角色定义；非零时用于覆盖
+  target_component: 1
+  heartbeat_timeout: 15.0
+
+# 多机共享位置坐标系。
+# 各机 PX4 EKF 的 LOCAL_POSITION_NED 原点由各自起飞点建立，位置不可跨机比较；
+# 启用后改用 GLOBAL_POSITION_INT 相对下面这个**共用原点**换算，两机位置才在同一系里。
+# 姿态与速度不受影响（本地 NED 与共享 ENU 同为"上=上"，无原点偏移问题）。
+shared_frame:
+  enabled: true
+  # Pegasus 世界原点，取自
+  # PegasusSimulator/extensions/pegasus.simulator/config/configs.yaml 的 global_coordinates。
+  # 两机共用同一原点，因此换算后的相对几何与 Isaac 世界系一致。
+  origin_latitude: 38.736832
+  origin_longitude: -9.137977
+  origin_altitude: 90.0
+  # 必须与 GPS 的产生方用同一地球模型，否则引入系统性尺度差。
+  # Pegasus 用球面重投影且半径取 6353000.0（geo_mag_utils.EARTH_RADIUS），
+  # 若这里留空而用 WGS-84 椭球，东向会有约 0.5% 尺度差（5 m 基线约 2.6 cm）。
+  earth_radius: 6353000.0
+
+# 任务默认值。命令行同名参数会覆盖它们，日常运行只需 --role/--execute，
+# 不必每次手写高度、时长与频率。
+tasks:
+  altitude: 2.0
+  hold_seconds: 30.0
+  rate_hz: 20.0
+  ready_timeout: 60.0
+  landing_timeout: 60.0
+  disarm_timeout: 15.0
+  offset_north: 0.0
+  offset_east: 0.0

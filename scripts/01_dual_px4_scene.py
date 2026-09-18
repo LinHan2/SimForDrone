@@ -5,15 +5,18 @@
 ``src/simfordrone``，使其能独立于启动命令继续演进和测试。
 """
 
+import os
 from pathlib import Path
 import sys
 
 from isaacsim import SimulationApp
 
+gui_enabled = os.environ.get("SIMFORDRONE_ISAAC_GUI", "0") == "1"
+
 simulation_app = SimulationApp(
     {
-        "headless": True,
-        "hide_ui": True,
+        "headless": not gui_enabled,
+        "hide_ui": not gui_enabled,
         "width": 1280,
         "height": 720,
         "renderer": "RayTracedLighting",
@@ -22,8 +25,8 @@ simulation_app = SimulationApp(
 
 from isaacsim.core.utils.extensions import enable_extension
 
-# 使用独立脚本的 WebRTC 扩展。不能在 SimulationApp 内加载完整 GUI
-# experience：服务器无窗口环境下曾在 UI 初始化阶段崩溃。
+# 使用独立脚本的 WebRTC 扩展。GUI 必须显式启用，因为无窗口服务器在 UI
+# 初始化阶段会失败。
 enable_extension("omni.services.livestream.nvcf")
 enable_extension("isaacsim.ros2.bridge")
 simulation_app.update()

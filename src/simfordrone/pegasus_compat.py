@@ -23,6 +23,9 @@ def enable_rgbd_ros2_depth_marker() -> None:
     upstream_update = MonocularCamera.update
 
     def update_with_depth_marker(self, *args, **kwargs):
+        # 上游会在最初 100 个渲染回调直接返回 None。该延迟与相机初始化无关，
+        # 却会阻止 ROS 2 writer 创建，尤其在 Warehouse 的 headless 首帧阶段明显。
+        self.counter = max(getattr(self, "counter", 100), 100)
         data = upstream_update(self, *args, **kwargs)
         if isinstance(data, dict) and getattr(self, "_depth", False):
             data["depth"] = True

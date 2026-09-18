@@ -1,0 +1,474 @@
+"""px4ctrl 统一入口。
+
+本模块是命令执行的**唯一**入口：所有对飞控的操作都经过 :mod:`px4ctrl.link`，所有控制
+计算都经过 :mod:`px4ctrl.controller` 与 :mod:`px4ctrl.fsm`。默认 dry-run，只有显式
+``--execute`` 才会真正飞行。
+
+任务
+----
+``probe``              只连接并打印遥测，不发任何命令
+``measure-hover``      用位置模式悬停，记录执行器指令以标定 ``hover_percentage``
+``takeoff-hover-land`` 用姿态+推力控制完成 自动起飞 → 悬停 → 降落 → 上锁
+``hold``               保持相对起点的站位（T2 的最小可用形态）
+
+用法::
+
+    python -m px4ctrl.cli probe --role target
+    python -m px4ctrl.cli takeoff-hover-land --role target --execute --hold-seconds 30
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import shutil
+import sys
+import time
+from dataclasses import replace
+from pathlib import Path
+from typing import Any, Callable
+
+from px4ctrl.controller import LinearControl
+from px4ctrl.fsm import PX4CtrlFSM, State
+from px4ctrl.inputs import vlen, yaw_from_quaternion
+from px4ctrl.link import MavlinkLink
+from px4ctrl.params import Params, ParamError, load_params
+from px4ctrl.vehicle import available_roles, resolve_role
+
+DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "config" / "sim.yaml"
+#: 保留的历史运行目录数量，避免日志无限占用磁盘。
+#: 单次运行仅约 30 KB，因此保留 20 次仍可忽略；轮转过早会让文档引用的证据消失。
+KEEP_RUNS = 20
+
+#: 站位保持的稳态误差门槛（m），取自规划文档对 T2 的验收标准。
+HOLD_STEADY_TOLERANCE_M = 0.5
+
+
+def prune_runs(root: Path, keep: int = KEEP_RUNS) -> None:
+    """只保留最近 ``keep`` 个运行目录。"""
+
+    if not root.is_dir():
+        return
+    runs = sorted((p for p in root.iterdir() if p.is_dir()), key=lambda p: p.name, reverse=True)
+    for stale in runs[keep:]:
+        shutil.rmtree(stale, ignore_errors=True)
+
+
+def write_log(output_dir: Path, payload: dict[str, Any]) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "run.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument(
+        "task",
+        choices=["probe", "measure-hover", "takeoff-hover-land", "hold"],
+        help="要执行的任务",
+    )
+    parser.add_argument("--role", choices=available_roles(), default="target")
+    parser.add_argument("--profile", choices=["sim", "real"], default="sim")
+    parser.add_argument("--config", type=Path, default=None, help="覆盖参数文件路径")
+    parser.add_argument("--execute", action="store_true", help="显式授权控制飞控；缺省仅探测")
+    # 以下运行参数缺省为 None，表示"取 YAML 的 tasks 段"，命令行只作覆盖。
+    parser.add_argument("--rate-hz", type=float, default=None, help="设定点流频率，必须 >2 Hz")
+    parser.add_argument("--altitude", type=float, default=None, help="任务高度（m）")
+    parser.add_argument("--offset-north", type=float, default=None)
+    parser.add_argument("--offset-east", type=float, default=None)
+    parser.add_argument("--hold-seconds", type=float, default=None)
+    parser.add_argument("--ready-timeout", type=float, default=None)
+    parser.add_argument("--landing-timeout", type=float, default=None)
+    parser.add_argument("--disarm-timeout", type=float, default=None)
+    parser.add_argument("--output-root", type=Path, default=Path("logs/px4ctrl"))
+    return parser.parse_args(argv)
+
+
+def apply_task_defaults(args: argparse.Namespace, params: Params) -> None:
+    """用 YAML 的 ``tasks`` 段补齐未在命令行给出的运行参数，并做取值校验。"""
+
+    defaults = params.tasks
+    for name, fallback in (
+        ("rate_hz", defaults.rate_hz),
+        ("altitude", defaults.altitude),
+        ("offset_north", defaults.offset_north),
+        ("offset_east", defaults.offset_east),
+        ("hold_seconds", defaults.hold_seconds),
+        ("ready_timeout", defaults.ready_timeout),
+        ("landing_timeout", defaults.landing_timeout),
+        ("disarm_timeout", defaults.disarm_timeout),
+    ):
+        if getattr(args, name) is None:
+            setattr(args, name, fallback)
+
+    if args.rate_hz <= 2.0:
+        raise ParamError("rate_hz 必须大于 2.0，否则 PX4 会因设定点流中断触发 failsafe")
+    if args.hold_seconds < 0.0:
+        raise ParamError("hold_seconds 必须非负")
+    if args.altitude is None or args.altitude <= 0.0:
+        raise ParamError("altitude 必须为正数")
+
+
+def resolve_params(args: argparse.Namespace) -> tuple[Params, Any]:
+    """加载参数并把角色端点与参数中的 system id 覆盖合并。"""
+
+    config_path = args.config
+    if config_path is None:
+        config_path = Path(__file__).resolve().parents[1] / "config" / f"{args.profile}.yaml"
+    params = load_params(config_path)
+    apply_task_defaults(args, params)
+
+    role = resolve_role(args.role)
+    if params.link.target_system:
+        role = replace(role, system_id=params.link.target_system)
+    return params, role
+
+
+def wait_ready(link: MavlinkLink, fsm: PX4CtrlFSM, timeout: float, log: Callable[[str], None]) -> None:
+    """等到载具在地面且遥测可用。
+
+    就绪判定只使用遥测：onboard 链路不下发 ``STATUSTEXT``，因此不能用
+    "Ready for takeoff" 文本作为门限。
+    """
+
+    log("等待载具就绪（在地面 + 遥测可用）...")
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        fsm.tick()
+        link.pump()
+        if link.odom.recv_time > 0.0 and link.is_landed():
+            log(f"就绪：ENU={link.odom.p}")
+            return
+        time.sleep(0.01)
+    raise RuntimeError(
+        f"在 {timeout:.1f}s 内未就绪：LOCAL_POSITION_NED="
+        f"{'已收到' if link.odom.recv_time > 0.0 else '未收到'}，"
+        f"landed_state={link.extended_state.landed_state}（需为 ON_GROUND=1）"
+    )
+
+
+def enter_offboard(link: MavlinkLink, fsm: PX4CtrlFSM, log: Callable[[str], None]) -> None:
+    """按 MAVSDK 的既定顺序进入 Offboard：先预热设定点流，再解锁，最后切模式。"""
+
+    fsm.enable()
+    log("预热设定点流 2.0s")
+    end = time.monotonic() + 2.0
+    while time.monotonic() < end:
+        fsm.tick()
+        time.sleep(0.01)
+
+    log(f"ARM: {link.arm(tick=fsm.tick)}")
+    log(f"OFFBOARD: {link.set_offboard(tick=fsm.tick)}")
+
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        fsm.tick()
+        if link.is_offboard():
+            log("OFFBOARD 已确认")
+            return
+        time.sleep(0.01)
+    raise RuntimeError("切换后未在 HEARTBEAT 中观测到 Offboard 主模式；PX4 可能已回落")
+
+
+def finish(link: MavlinkLink, fsm: PX4CtrlFSM, landing_timeout: float, log: Callable[[str], None]) -> dict[str, Any]:
+    """兜底收尾：请求降落 → 确认落地 → 上锁。所有退出路径都必须调用。"""
+
+    result: dict[str, Any] = {"land_command": None, "on_ground": False, "disarmed": False}
+    try:
+        result["land_command"] = link.land(tick=fsm.tick)
+        log("LAND 已被接受")
+    except Exception as error:  # 收尾失败不能掩盖原始故障
+        result["land_error"] = str(error)
+        log(f"WARN: 降落命令失败: {error}")
+
+    fsm.disable()
+    deadline = time.monotonic() + landing_timeout
+    while time.monotonic() < deadline:
+        link.pump()
+        if link.is_landed():
+            result["on_ground"] = True
+            break
+        time.sleep(0.02)
+
+    try:
+        link.disarm(tick=None)
+        result["disarm_command"] = "accepted"
+    except Exception as error:
+        result["disarm_error"] = str(error)
+        log(f"WARN: 上锁命令失败: {error}")
+
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        link.pump()
+        if not link.state.armed:
+            result["disarmed"] = True
+            break
+        time.sleep(0.02)
+    log(f"收尾完成：on_ground={result['on_ground']}, disarmed={result['disarmed']}")
+    return result
+
+
+def run_probe(link: MavlinkLink, fsm: PX4CtrlFSM, args: argparse.Namespace) -> dict[str, Any]:
+    """只收集一小段遥测，用于确认端点与坐标系转换。"""
+
+    samples: list[dict[str, float]] = []
+    end = time.monotonic() + 3.0
+    while time.monotonic() < end:
+        fsm.tick()
+        if link.odom.recv_time > 0.0:
+            samples.append(
+                {
+                    "z": link.odom.p[2],
+                    "v": vlen(link.odom.v),
+                    "thrust": link.mean_actuator or 0.0,
+                }
+            )
+        time.sleep(0.02)
+    return {"samples": samples[-10:], "landed_state": link.extended_state.landed_state}
+
+
+def run_measure_hover(
+    link: MavlinkLink, fsm: PX4CtrlFSM, args: argparse.Namespace, log: Callable[[str], None]
+) -> dict[str, Any]:
+    """用位置模式悬停，记录执行器指令，用于标定 ``hover_percentage``。
+
+    位置模式是已验收的通路；本任务不涉及姿态控制，因此可以安全地先做推力标定。
+    """
+
+    altitude = args.altitude
+    home = link.odom.p
+    # 保持起飞时的机头朝向，避免标定过程混入一次无意义的偏航旋转。
+    hold_yaw = yaw_from_quaternion(link.odom.q)
+    target = (home[0], home[1], home[2] + altitude)
+    log(f"位置模式爬升到 ENU={target}（保持偏航 {hold_yaw:.3f} rad）")
+
+    fsm.enable()
+    end = time.monotonic() + 2.0
+    while time.monotonic() < end:
+        link.send_position_target(home, hold_yaw)
+        link.pump()
+        time.sleep(1.0 / args.rate_hz)
+
+    log(f"ARM: {link.arm()}")
+    log(f"OFFBOARD: {link.set_offboard()}")
+
+    samples: list[float] = []
+    altitudes: list[float] = []
+    rate = 1.0 / args.rate_hz
+    deadline = time.monotonic() + 8.0 + args.hold_seconds
+    while time.monotonic() < deadline:
+        link.send_position_target(target, hold_yaw)
+        link.pump()
+        if link.odom.recv_time > 0.0 and link.mean_actuator is not None:
+            altitude_now = link.odom.p[2] - home[2]
+            altitudes.append(altitude_now)
+            # 只有接近目标高度、且垂直速度很小的样本才用于标定。
+            if altitude_now > altitude - 0.3 and abs(link.odom.v[2]) < 0.15:
+                samples.append(link.mean_actuator)
+        time.sleep(rate)
+
+    suggested = (sum(samples) / len(samples)) if samples else None
+    log(f"标定样本 {len(samples)} 个；建议 hover_percentage = {suggested}")
+
+    # 标定任务同样必须收尾降落，否则载具会被留在 Offboard 悬停状态。
+    # 这里保持流开启交给 finish：它内部的 tick 需要流不中断才能安全切到 AUTO_LAND。
+    result = finish(link, fsm, args.landing_timeout, log)
+
+    return {
+        "altitude_samples": len(altitudes),
+        "max_altitude": max(altitudes) if altitudes else None,
+        "hover_samples": len(samples),
+        "suggested_hover_percentage": suggested,
+        **result,
+    }
+
+
+def run_takeoff_hover_land(
+    link: MavlinkLink, fsm: PX4CtrlFSM, args: argparse.Namespace, log: Callable[[str], None]
+) -> dict[str, Any]:
+    """自动起飞 → 悬停 → 降落，全部使用姿态+推力控制（px4ctrl 的控制输出）。"""
+
+    enter_offboard(link, fsm, log)
+    fsm.request_takeoff(time.monotonic())
+
+    samples: list[dict[str, float]] = []
+    errors: list[float] = []
+    hold_target = (
+        link.odom.p[0] + args.offset_north,
+        link.odom.p[1] + args.offset_east,
+        link.odom.p[2] + fsm.params.takeoff_land.takeoff_height,
+    )
+    start = time.monotonic()
+    hover_seen_at: float | None = None
+    rate = 1.0 / args.rate_hz
+
+    while True:
+        now = time.monotonic()
+        output = fsm.process(now)
+        if link.odom.recv_time > 0.0:
+            altitude = link.odom.p[2] - fsm.takeoff_land.start_pose[2]
+            samples.append({"t": now - start, "altitude": altitude, "thrust": output.thrust})
+            if fsm.state == State.AUTO_HOVER:
+                if hover_seen_at is None:
+                    hover_seen_at = now
+                errors.append(math.dist(link.odom.p, fsm.hover_pose))
+                if now - hover_seen_at >= args.hold_seconds:
+                    break
+            if now - start > 120.0:
+                raise RuntimeError("起飞后在 120s 内未进入悬停并完成保持")
+        time.sleep(rate)
+
+    max_altitude = max((s["altitude"] for s in samples), default=0.0)
+    result = finish(link, fsm, args.landing_timeout, log)
+    return {
+        "max_altitude_m": max_altitude,
+        "hold_error_mean_m": (sum(errors) / len(errors)) if errors else None,
+        "hold_error_max_m": max(errors) if errors else None,
+        "hold_samples": len(errors),
+        "samples": samples[:: max(1, len(samples) // 200)],
+        **result,
+    }
+
+
+def run_hold(
+    link: MavlinkLink, fsm: PX4CtrlFSM, args: argparse.Namespace, log: Callable[[str], None]
+) -> dict[str, Any]:
+    """保持相对起点的站位（T2 的最小形态，单机）。"""
+
+    enter_offboard(link, fsm, log)
+    start_pose = link.odom.p
+    fsm.takeoff_land.start_pose = start_pose
+    altitude = args.altitude
+    target = (
+        start_pose[0] + args.offset_north,
+        start_pose[1] + args.offset_east,
+        start_pose[2] + altitude,
+    )
+    log(f"HOLD：目标 ENU={target}")
+
+    fsm.request_takeoff(time.monotonic())
+    rate = 1.0 / args.rate_hz
+    errors: list[float] = []
+    #: 时间序列：t(相对悬停起点) / 位置误差 / 高度 / 推力。
+    #: 整定需要区分"进入悬停时的瞬态"与"稳态"，只看聚合值无法判断该调哪个增益。
+    series: list[dict[str, float]] = []
+    deadline = time.monotonic() + 30.0 + args.hold_seconds
+    settled_at: float | None = None
+    while time.monotonic() < deadline:
+        now = time.monotonic()
+        output = fsm.process(now)
+        if fsm.state == State.AUTO_HOVER:
+            if settled_at is None:
+                settled_at = now
+            error = math.dist(link.odom.p, fsm.hover_pose)
+            errors.append(error)
+            series.append(
+                {
+                    "t": now - settled_at,
+                    "error": error,
+                    "altitude": fsm.altitude,
+                    "thrust": output.thrust,
+                }
+            )
+            if now - settled_at >= args.hold_seconds:
+                break
+        time.sleep(rate)
+
+    result = finish(link, fsm, args.landing_timeout, log)
+
+    # 稳态统计：去掉前 SETTLE_SKIP 秒，避免把爬升/收敛过程算进保持精度。
+    settle_skip = 8.0
+    steady = [s["error"] for s in series if s["t"] >= settle_skip]
+    return {
+        "hold_error_mean_m": (sum(errors) / len(errors)) if errors else None,
+        "hold_error_max_m": max(errors) if errors else None,
+        "hold_samples": len(errors),
+        "steady_error_mean_m": (sum(steady) / len(steady)) if steady else None,
+        "steady_error_max_m": max(steady) if steady else None,
+        "steady_samples": len(steady),
+        "settle_skip_s": settle_skip,
+        "samples": series[:: max(1, len(series) // 300)],
+        **result,
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    params, role = resolve_params(args)
+    output_dir = args.output_root / f"{args.task}-{role.name}-{time.strftime('%Y%m%d-%H%M%S')}"
+    prune_runs(args.output_root)
+
+    record: dict[str, Any] = {
+        "task": args.task,
+        "role": role.name,
+        "profile": args.profile,
+        "execute": args.execute,
+        "rate_hz": args.rate_hz,
+        "connection": params.link.connection or role.sim_connection,
+        "expected_system_id": role.system_id,
+    }
+
+    link = MavlinkLink(params.link, role, shared_frame=params.shared_frame)
+    fsm = PX4CtrlFSM(params, LinearControl(params), link)
+    try:
+        link.open()
+        record["heartbeat_system_id"] = link.connection.target_system
+        if args.task == "probe" or not args.execute:
+            outcome = run_probe(link, fsm, args)
+            record.update(outcome)
+            record["result"] = "dry_run_probe_ok"
+            print("DRY RUN PASS: 未发送任何控制命令。使用 --execute 才会飞行。")
+            return 0
+
+        wait_ready(link, fsm, args.ready_timeout, print)
+
+        if args.task == "measure-hover":
+            record.update(run_measure_hover(link, fsm, args, print))
+        elif args.task == "takeoff-hover-land":
+            record.update(run_takeoff_hover_land(link, fsm, args, print))
+        elif args.task == "hold":
+            record.update(run_hold(link, fsm, args, print))
+
+        record["result"] = "completed"
+        # 所有任务都必须安全收尾；标定任务还必须有可用样本，否则"通过"是无意义的。
+        passed = bool(record.get("on_ground")) and bool(record.get("disarmed"))
+        if args.task == "measure-hover":
+            passed = passed and record.get("suggested_hover_percentage") is not None
+        elif args.task in ("takeoff-hover-land", "hold"):
+            passed = passed and bool(record.get("hold_samples"))
+            # 规划文档对 T2 的验收是"稳定后站位误差 < 0.5 m"。用稳态误差而非聚合值
+            # 判定，否则爬升/交接瞬态会掩盖真实的保持精度。
+            steady = record.get("steady_error_mean_m")
+            passed = passed and steady is not None and steady <= HOLD_STEADY_TOLERANCE_M
+        record["passed"] = passed
+        print(f"{'PASS' if passed else 'FAIL'}: {args.task}")
+        return 0 if passed else 1
+    except KeyboardInterrupt:
+        record["result"] = "interrupted"
+        print("INTERRUPT: 正在执行兜底降落", file=sys.stderr)
+        try:
+            finish(link, fsm, args.landing_timeout, print)
+        except Exception as error:  # 兜底路径不能再抛，否则掩盖中断
+            record["failsafe_error"] = str(error)
+        return 130
+    except Exception as error:
+        record["result"] = "failed"
+        record["error"] = str(error)
+        print(f"FAIL: {error}", file=sys.stderr)
+        try:
+            if fsm.stream_enabled:
+                finish(link, fsm, args.landing_timeout, print)
+        except Exception as inner:  # 兜底路径不能再抛
+            record["failsafe_error"] = str(inner)
+        return 1
+    finally:
+        write_log(output_dir, record)
+        link.close()
+        print(f"LOG: {output_dir}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

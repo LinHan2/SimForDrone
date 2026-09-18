@@ -1,0 +1,74 @@
+# px4ctrl 真机参数。
+# 与 sim.yaml 的唯一结构性差异是 link 段：控制器、状态机与制导逻辑完全一致。
+
+mass: 0.8            # kg，按实际机架填写
+gra: 9.81
+ctrl_freq_max: 100.0
+use_bodyrate_ctrl: false
+max_angle: 15.0      # 真机首次调试建议保守
+max_manual_vel: 2.5
+
+auto_takeoff_land:
+  enable: true
+  enable_auto_arm: true
+  no_rc: false
+  takeoff_height: 1.0
+  takeoff_land_speed: 0.5
+
+thrust_model:
+  print_value: true
+  accurate_thrust_model: true
+  K1: 0.7583
+  K2: 1.6942
+  K3: 0.6786
+  # ⚠️ 必须对本机实测，不要沿用示例值。本控制律中悬停时的推力指令恰好等于该值
+  #    （thrust = des_a_z / thr2acc，thr2acc = gra / hover_percentage）。
+  #    真机首次上电前先用位置模式悬停测一次，方法与 sim.yaml 中的记录一致。
+  hover_percentage: 0.30
+
+gain:
+  Kp0: 6.0
+  Kp1: 6.0
+  Kp2: 5.0
+  Kv0: 4.0
+  Kv1: 4.0
+  Kv2: 5.0
+  KAngR: 20.0
+  KAngP: 20.0
+  KAngY: 20.0
+
+msg_timeout:
+  odom: 0.5
+  rc: 0.5
+  cmd: 0.5
+  imu: 0.5
+  bat: 0.5
+
+link:
+  # 真机连接串：USB 直连用 serial，机载计算机经网络用 udpout。
+  #   serial:/dev/ttyACM0:921600
+  #   udpout:192.168.1.10:14550
+  connection: "serial:/dev/ttyACM0:921600"
+  target_system: 1
+  target_component: 1
+  heartbeat_timeout: 15.0
+
+# 多机共享位置坐标系。
+# 真机上请填入**所有载具共用**的基准点：实测好的 home 坐标，或 RTK 基准站位置。
+# 用错原点不会破坏相对几何，但会让整组坐标整体平移，因此必须与实际起降点一致。
+shared_frame:
+  enabled: false            # 单机调试时可关闭；多机跟踪前必须启用并填好原点
+  origin_latitude: 0.0
+  origin_longitude: 0.0
+  origin_altitude: 0.0
+
+# 任务默认值；真机首飞建议从更低高度、更短时长开始。
+tasks:
+  altitude: 1.0
+  hold_seconds: 15.0
+  rate_hz: 20.0
+  ready_timeout: 60.0
+  landing_timeout: 60.0
+  disarm_timeout: 15.0
+  offset_north: 0.0
+  offset_east: 0.0

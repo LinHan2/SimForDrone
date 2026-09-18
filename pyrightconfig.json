@@ -1,0 +1,6 @@
+{
+  "extraPaths": [
+    "tracking",
+    "px4ctrl"
+  ]
+}

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+import time
 
 import carb
 import omni.timeline
@@ -50,16 +51,32 @@ class DualUavObservationApp:
         IndustrialHangar(self.world.stage, self.world, self.config["environment"]).build()
 
         enable_rgbd_ros2_depth_marker()
-        self._create_vehicle(self.config["vehicles"]["target"], attach_camera=False)
-        self._create_vehicle(self.config["vehicles"]["tracker"], attach_camera=True)
+        # 角色 → 载具句柄注册表：GUI 监视窗与终端状态输出都按角色读取世界位姿，
+        # 避免在别处重复硬编码 "target"/"tracker" 字符串及其序号。
+        self.vehicles: dict[str, dict] = {}
+        self._create_vehicle("target", self.config["vehicles"]["target"], attach_camera=False)
+        self._create_vehicle("tracker", self.config["vehicles"]["tracker"], attach_camera=True)
 
         self.world.reset()
         # WebRTC 全局观察相机，仅供人眼查看；它不等于跟随机机载传感器。
         self.pg.set_viewport_camera(self.config["viewport"]["position"], self.config["viewport"]["target"])
+        # GUI 监视窗只在本地桌面模式创建：headless/WebRTC 下 omni.ui 会初始化失败，
+        # 因此该分支延迟导入，保证无窗口服务器仍能正常启动场景。
+        self.vehicle_monitor = None
+        if os.environ.get("SIMFORDRONE_ISAAC_GUI", "0") == "1":
+            from simfordrone.vehicle_monitor import VehicleMonitorWindow
+
+            self.vehicle_monitor = VehicleMonitorWindow(self.vehicles)
+        # headless 模式没有可交互面板，改用终端周期输出同样的两机状态，
+        # 使 WebRTC 用户也能核对物体位置而不仅看到画面。
+        self._next_console_status = time.monotonic()
+        # 监视窗单独节流到 10 Hz：物理步进远高于此，逐帧更新 UI 模型只是浪费渲染时间。
+        self._next_monitor_update = time.monotonic()
         self.stop_sim = False
 
     def _create_vehicle(
         self,
+        role: str,
         vehicle: dict,
         *,
         attach_camera: bool,
@@ -99,7 +116,7 @@ class DualUavObservationApp:
                 MonocularCamera(self.config["observer_camera"]["name"], config=self._camera_config())
             ]
 
-        Multirotor(
+        multirotor = Multirotor(
             stage_path,
             ROBOTS["Iris"],
             vehicle_id,
@@ -107,6 +124,16 @@ class DualUavObservationApp:
             Rotation.from_euler("XYZ", [0.0, 0.0, 0.0], degrees=True).as_quat(),
             config=config,
         )
+        # 登记静态身份信息（stage 路径、序号、PX4 端点）。system_id 与 MAVLink 端口
+        # 由 PX4 SITL 固定规则推出：system_id = instance+1、offboard 端口 = 14540+instance，
+        # 与 px4ctrl/vehicle.py 的 VehicleRole 必须保持一致，否则会控制错机。
+        self.vehicles[role] = {
+            "vehicle": multirotor,
+            "stage_path": stage_path,
+            "vehicle_id": vehicle_id,
+            "system_id": vehicle_id + 1,
+            "mavlink_port": 14540 + vehicle_id,
+        }
 
     def _camera_config(self) -> dict:
         """把 YAML 的人类可读字段转换为 Pegasus 传感器字段。"""
@@ -126,6 +153,24 @@ class DualUavObservationApp:
         self.timeline.play()
         while self.simulation_app.is_running() and not self.stop_sim:
             self.world.step(render=True)
+            # 监视窗读取的是 Pegasus 自己维护的 vehicle.state（Isaac 世界系 ENU），
+            # 不引入第二套位姿来源，避免与飞控 EKF 估计混淆。
+            now = time.monotonic()
+            if self.vehicle_monitor is not None and now >= self._next_monitor_update:
+                self.vehicle_monitor.update()
+                self._next_monitor_update = now + 0.1
+            # 终端状态按 1 Hz 节流输出：物理步进频率远高于此，逐帧打印会淹没日志。
+            if now >= self._next_console_status:
+                fields = []
+                for role, entry in self.vehicles.items():
+                    state = entry["vehicle"].state
+                    fields.append(
+                        f"{role}: p=({state.position[0]:+.2f},{state.position[1]:+.2f},"
+                        f"{state.position[2]:+.2f}) v=({state.linear_velocity[0]:+.2f},"
+                        f"{state.linear_velocity[1]:+.2f},{state.linear_velocity[2]:+.2f})"
+                    )
+                print("[vehicle-state] " + " | ".join(fields), flush=True)
+                self._next_console_status = now + 1.0
 
         carb.log_warn("DualUavObservationApp 正在关闭。")
         self.timeline.stop()
