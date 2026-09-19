@@ -17,10 +17,28 @@ auto_takeoff_land:
 
 thrust_model:
   print_value: true
+  # 上游遗留开关，不参与计算（详见 sim.yaml 同名项注释）。
   accurate_thrust_model: true
   K1: 0.7583
   K2: 1.6942
   K3: 0.6786
+  # 倾角垂向推力补偿：真机同样建议开启。
+  tilt_compensation: true
+  # 在线油门/推力模型（RLS 估计 thr2acc）。真机建立油门模型时打开；
+  # 标定流程见 READMELIST/runbook.md 的“真机油门模型标定”。
+  # 收敛后把 suggested_hover_percentage 写回本文件的 hover_percentage，
+  # 再把它关掉（下次起飞直接使用固化好的标定值）。
+  online_estimate: false
+  # 配对延迟窗口（s）：推力指令与加速度响应之间的执行器+传输滞后（上游默认值）。
+  # 本文件 tasks.rate_hz = 50（20 ms 周期）满足“周期 < 窗口下限 35 ms”，
+  # 因此可以严格按窗口配对，不需要降级。
+  estimate_delay_min_s: 0.035
+  estimate_delay_max_s: 0.045
+  estimate_allow_degraded: true
+  # thr2acc 允许范围（以标定值为倍数的上下界）；越界更新被拒绝并计数。
+  # 真机传感器噪声大，若发现拒绝频繁，再考虑放宽上界。
+  estimate_min_ratio: 0.5
+  estimate_max_ratio: 2.0
   # ⚠️ 必须对本机实测，不要沿用示例值。本控制律中悬停时的推力指令恰好等于该值
   #    （thrust = des_a_z / thr2acc，thr2acc = gra / hover_percentage）。
   #    真机首次上电前先用位置模式悬停测一次，方法与 sim.yaml 中的记录一致。
@@ -66,7 +84,9 @@ shared_frame:
 tasks:
   altitude: 1.0
   hold_seconds: 15.0
-  rate_hz: 20.0
+  # 50 Hz（20 ms 周期）：满足在线推力模型的配对窗口（周期 < 下限 35 ms）。
+  # PX4 只要求设定点流 > 2 Hz，但低于 ~25 Hz 时在线估计只能降级配对。
+  rate_hz: 50.0
   ready_timeout: 60.0
   landing_timeout: 60.0
   disarm_timeout: 15.0

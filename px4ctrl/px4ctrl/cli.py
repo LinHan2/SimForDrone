@@ -37,6 +37,11 @@ from px4ctrl.params import Params, ParamError, load_params
 from px4ctrl.vehicle import available_roles, resolve_role
 
 DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "config" / "sim.yaml"
+COMMAND_STREAM_HZ_MIN = 2.0
+#: 常规上锁后等待其生效的时间（s）；仍未生效则尝试强制上锁。
+DISARM_SETTLE_S = 5.0
+#: 收尾时等待上锁生效的默认时长（s）；由任务参数 ``disarm_timeout`` 覆盖。
+DISARM_TIMEOUT_S = 15.0
 #: 保留的历史运行目录数量，避免日志无限占用磁盘。
 #: 单次运行仅约 30 KB，因此保留 20 次仍可忽略；轮转过早会让文档引用的证据消失。
 KEEP_RUNS = 20
@@ -63,6 +68,27 @@ def write_log(output_dir: Path, payload: dict[str, Any]) -> None:
     )
 
 
+def thrust_model_record(fsm: PX4CtrlFSM) -> dict[str, Any]:
+    """导出推力模型的最终状态，供离线核对在线估计的收敛情况。
+
+    只记录结果是不够的：``stats`` 能区分“没开估计”、“开了但窗口从未命中（控制频率
+    过低）”、“更新被越界拒绝（IMU 符号/标定可疑）”这三种完全不同的情况。
+    """
+
+    controller = fsm.controller
+    model = fsm.params.thrust_model
+    return {
+        "thr2acc_initial": fsm.params.gra / model.hover_percentage,
+        "thr2acc_final": controller.thrust_to_accel,
+        "suggested_hover_percentage": controller.suggested_hover_percentage(),
+        "online_estimate": model.online_estimate,
+        "tilt_compensation": model.tilt_compensation,
+        "delay_window_s": [model.estimate_delay_min_s, model.estimate_delay_max_s],
+        "estimate_period_s": controller.estimate_period_s,
+        "stats": controller.estimate_stats.as_dict(),
+    }
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
@@ -83,6 +109,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ready-timeout", type=float, default=None)
     parser.add_argument("--landing-timeout", type=float, default=None)
     parser.add_argument("--disarm-timeout", type=float, default=None)
+    parser.add_argument(
+        "--online-estimate",
+        action="store_true",
+        help="本次运行启用 RLS 在线估计 thr2acc（油门模型）；覆盖 YAML 的在线估计开关",
+    )
     parser.add_argument("--output-root", type=Path, default=Path("logs/px4ctrl"))
     return parser.parse_args(argv)
 
@@ -120,6 +151,25 @@ def resolve_params(args: argparse.Namespace) -> tuple[Params, Any]:
         config_path = Path(__file__).resolve().parents[1] / "config" / f"{args.profile}.yaml"
     params = load_params(config_path)
     apply_task_defaults(args, params)
+
+    # 命令行只允许**打开**在线估计（标定用），不允许关闭 YAML 里已打开的开关：
+    # 用一个开关把正在使用的模型悄悄关掉，比多跑一次标定危险得多。
+    if args.online_estimate and not params.thrust_model.online_estimate:
+        params = replace(
+            params, thrust_model=replace(params.thrust_model, online_estimate=True)
+        )
+
+    # 配对窗口与控制频率必须一致：周期大于窗口上界时窗口内永远不会出现样本。
+    if params.thrust_model.online_estimate:
+        model = params.thrust_model
+        period = 1.0 / args.rate_hz
+        if period > model.estimate_delay_max_s:
+            print(
+                f"提示：控制周期 {period * 1000.0:.0f} ms 大于配对窗口上界 "
+                f"{model.estimate_delay_max_s * 1000.0:.0f} ms，在线估计将使用降级配对"
+                f"（{'已允许' if model.estimate_allow_degraded else '已禁用，估计不会更新'}）。"
+                "真机标定建议 --rate-hz 50 以上。"
+            )
 
     role = resolve_role(args.role)
     if params.link.target_system:
@@ -173,10 +223,28 @@ def enter_offboard(link: MavlinkLink, fsm: PX4CtrlFSM, log: Callable[[str], None
     raise RuntimeError("切换后未在 HEARTBEAT 中观测到 Offboard 主模式；PX4 可能已回落")
 
 
-def finish(link: MavlinkLink, fsm: PX4CtrlFSM, landing_timeout: float, log: Callable[[str], None]) -> dict[str, Any]:
-    """兜底收尾：请求降落 → 确认落地 → 上锁。所有退出路径都必须调用。"""
+def finish(
+    link: MavlinkLink,
+    fsm: PX4CtrlFSM,
+    landing_timeout: float,
+    log: Callable[[str], None],
+    disarm_timeout: float = DISARM_TIMEOUT_S,
+) -> dict[str, Any]:
+    """兜底收尾：请求降落 → 确认落地 → 上锁。所有退出路径都必须调用。
 
-    result: dict[str, Any] = {"land_command": None, "on_ground": False, "disarmed": False}
+    上锁分**两级**，因为 PX4 会拒绝在地面判定未成立时的常规上锁（实测日志：
+    ``Disarming denied: not landed``）。旧实现只记录不重试，于是收尾结果不再反映
+    我们的指令是否被接受——最后一次实验里 target 实际是靠 PX4 自身的
+    ``Failsafe: blind land`` 落地并上锁的，而我们的 ``run.json`` 只能记一个 WARN。
+    """
+
+    result: dict[str, Any] = {
+        "land_command": None,
+        "on_ground": False,
+        "disarmed": False,
+        "disarm_forced": False,
+        "disarm_attempts": [],
+    }
     try:
         result["land_command"] = link.land(tick=fsm.tick)
         log("LAND 已被接受")
@@ -193,21 +261,51 @@ def finish(link: MavlinkLink, fsm: PX4CtrlFSM, landing_timeout: float, log: Call
             break
         time.sleep(0.02)
 
+    # 第一级：常规上锁。
+    attempt: dict[str, Any] = {"force": False, "accepted": False, "error": None}
     try:
         link.disarm(tick=None)
+        attempt["accepted"] = True
         result["disarm_command"] = "accepted"
     except Exception as error:
+        attempt["error"] = str(error)
         result["disarm_error"] = str(error)
-        log(f"WARN: 上锁命令失败: {error}")
+        log(f"WARN: 常规上锁被拒: {error}")
+    result["disarm_attempts"].append(attempt)
 
-    deadline = time.monotonic() + 10.0
+    # 常规上锁后仍可能因为状态机延迟而尚未生效，因此先给它一段有限等待。
+    deadline = time.monotonic() + DISARM_SETTLE_S
+    while time.monotonic() < deadline:
+        link.pump()
+        if not link.state.armed:
+            break
+        time.sleep(0.02)
+
+    # 第二级：仍未上锁则强制上锁（PX4 魔术参数 21196）。宁可多一次带强制的尝试，
+    # 也不要让飞机停在"已落地但保持解锁"的状态、把收尾交给飞控 failsafe。
+    if link.state.armed:
+        log("常规上锁未生效，尝试强制上锁")
+        attempt = {"force": True, "accepted": False, "error": None}
+        try:
+            link.disarm(force=True, tick=None)
+            attempt["accepted"] = True
+            result["disarm_forced"] = True
+        except Exception as error:
+            attempt["error"] = str(error)
+            log(f"WARN: 强制上锁失败: {error}")
+        result["disarm_attempts"].append(attempt)
+
+    deadline = time.monotonic() + disarm_timeout
     while time.monotonic() < deadline:
         link.pump()
         if not link.state.armed:
             result["disarmed"] = True
             break
         time.sleep(0.02)
-    log(f"收尾完成：on_ground={result['on_ground']}, disarmed={result['disarmed']}")
+    log(
+        f"收尾完成：on_ground={result['on_ground']}, disarmed={result['disarmed']}"
+        f"{'（强制）' if result['disarm_forced'] else ''}"
+    )
     return result
 
 
@@ -275,7 +373,7 @@ def run_measure_hover(
 
     # 标定任务同样必须收尾降落，否则载具会被留在 Offboard 悬停状态。
     # 这里保持流开启交给 finish：它内部的 tick 需要流不中断才能安全切到 AUTO_LAND。
-    result = finish(link, fsm, args.landing_timeout, log)
+    result = finish(link, fsm, args.landing_timeout, log, args.disarm_timeout)
 
     return {
         "altitude_samples": len(altitudes),
@@ -310,7 +408,14 @@ def run_takeoff_hover_land(
         output = fsm.process(now)
         if link.odom.recv_time > 0.0:
             altitude = link.odom.p[2] - fsm.takeoff_land.start_pose[2]
-            samples.append({"t": now - start, "altitude": altitude, "thrust": output.thrust})
+            samples.append(
+                {
+                    "t": now - start,
+                    "altitude": altitude,
+                    "thrust": output.thrust,
+                    "thr2acc": fsm.controller.thrust_to_accel,
+                }
+            )
             if fsm.state == State.AUTO_HOVER:
                 if hover_seen_at is None:
                     hover_seen_at = now
@@ -322,7 +427,7 @@ def run_takeoff_hover_land(
         time.sleep(rate)
 
     max_altitude = max((s["altitude"] for s in samples), default=0.0)
-    result = finish(link, fsm, args.landing_timeout, log)
+    result = finish(link, fsm, args.landing_timeout, log, args.disarm_timeout)
     return {
         "max_altitude_m": max_altitude,
         "hold_error_mean_m": (sum(errors) / len(errors)) if errors else None,
@@ -371,13 +476,15 @@ def run_hold(
                     "error": error,
                     "altitude": fsm.altitude,
                     "thrust": output.thrust,
+                    # 在线推力模型的收敛过程：标定时看这一个序列就够了。
+                    "thr2acc": fsm.controller.thrust_to_accel,
                 }
             )
             if now - settled_at >= args.hold_seconds:
                 break
         time.sleep(rate)
 
-    result = finish(link, fsm, args.landing_timeout, log)
+    result = finish(link, fsm, args.landing_timeout, log, args.disarm_timeout)
 
     # 稳态统计：去掉前 SETTLE_SKIP 秒，避免把爬升/收敛过程算进保持精度。
     settle_skip = 8.0
@@ -432,6 +539,8 @@ def main(argv: list[str] | None = None) -> int:
         elif args.task == "hold":
             record.update(run_hold(link, fsm, args, print))
 
+        # 推力模型的最终值与统计：无论是否开启在线估计都记录，便于对比。
+        record["thrust_model"] = thrust_model_record(fsm)
         record["result"] = "completed"
         # 所有任务都必须安全收尾；标定任务还必须有可用样本，否则"通过"是无意义的。
         passed = bool(record.get("on_ground")) and bool(record.get("disarmed"))
@@ -450,7 +559,7 @@ def main(argv: list[str] | None = None) -> int:
         record["result"] = "interrupted"
         print("INTERRUPT: 正在执行兜底降落", file=sys.stderr)
         try:
-            finish(link, fsm, args.landing_timeout, print)
+            finish(link, fsm, args.landing_timeout, print, args.disarm_timeout)
         except Exception as error:  # 兜底路径不能再抛，否则掩盖中断
             record["failsafe_error"] = str(error)
         return 130
@@ -460,7 +569,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"FAIL: {error}", file=sys.stderr)
         try:
             if fsm.stream_enabled:
-                finish(link, fsm, args.landing_timeout, print)
+                finish(link, fsm, args.landing_timeout, print, args.disarm_timeout)
         except Exception as inner:  # 兜底路径不能再抛
             record["failsafe_error"] = str(inner)
         return 1

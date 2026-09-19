@@ -5,7 +5,7 @@ set -Ee -o pipefail
 
 # 验收端使用系统 ROS Jazzy，与 Isaac Sim 内部 Python 3.11 进程严格分离。
 SIMFORDRONE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-source "${SIMFORDRONE_ROOT}/env/activate_system_ros2_jazzy.sh"
+source "${SIMFORDRONE_ROOT}/scripts/env/activate_system_ros2_jazzy.sh"
 
 required_topics=(
     /target_uav_0/state/pose

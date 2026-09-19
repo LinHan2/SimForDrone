@@ -1,4 +1,4 @@
-"""Run the V0 static-target tracking experiment with two PX4 vehicles."""
+"""单进程内的 V0 静态目标跟踪实验（同时控制两台 PX4）。"""
 
 from __future__ import annotations
 
@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def command_from_reference(reference) -> CommandData:
-    """Convert the algorithm-layer contract at the px4ctrl boundary."""
+    """在 px4ctrl 边界处转换算法层的接口契约。"""
 
     return CommandData(
         recv_time=time.monotonic(),
@@ -69,7 +69,7 @@ def wait_shared_positions(
     tracker_link: MavlinkLink,
     timeout: float,
 ) -> None:
-    """Wait for both GLOBAL_POSITION_INT streams to populate shared ENU."""
+    """等待两路 GLOBAL_POSITION_INT 均就绪，填满共享 ENU。"""
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -96,7 +96,7 @@ def enter_offboard_both(
     tracker_link: MavlinkLink,
     tracker_fsm: PX4CtrlFSM,
 ) -> None:
-    """Prestream, arm, and enter Offboard without interrupting either stream."""
+    """先预热设定点流、再解锁、最后进 Offboard，全程不断流。"""
 
     target_fsm.request_hover(time.monotonic())
     tracker_fsm.request_hover(time.monotonic())
@@ -133,7 +133,7 @@ def land_both(
     tracker_fsm: PX4CtrlFSM,
     timeout: float,
 ) -> dict[str, bool]:
-    """Command both vehicles to land, then confirm ground and disarm."""
+    """命令两台飞行器降落，随后确认落地并上锁。"""
 
     result = {"target_on_ground": False, "tracker_on_ground": False, "target_disarmed": False, "tracker_disarmed": False}
     tick = lambda: pump_both(target_fsm, tracker_fsm)

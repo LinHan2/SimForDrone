@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 
 SIMFORDRONE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-source "${SIMFORDRONE_ROOT}/env/activate_system_ros2_jazzy.sh"
+source "${SIMFORDRONE_ROOT}/scripts/env/activate_system_ros2_jazzy.sh"
 
 capture_log="$(mktemp)"
 trap 'rm -f "${capture_log}"' EXIT

@@ -10,7 +10,7 @@ set -Eeuo pipefail
 
 SIMFORDRONE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export SIMFORDRONE_ROOT
-source "${SIMFORDRONE_ROOT}/env/activate_px4_mavlink_control.sh"
+source "${SIMFORDRONE_ROOT}/scripts/env/activate_px4_mavlink_control.sh"
 
 cd "${SIMFORDRONE_ROOT}/px4ctrl"
 # 显式给出绝对日志根目录：否则相对路径会落在包目录里，且随启动方式而变化。

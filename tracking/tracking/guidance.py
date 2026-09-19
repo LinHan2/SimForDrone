@@ -1,9 +1,7 @@
-"""V0 ground-truth position tracking reference generator.
+"""V0 真值位置跟踪的参考生成器。
 
-The target and observer geometry lives in a shared ENU frame. PX4 position
-control, however, uses the observer's local ENU frame. The conversion below
-transfers only the shared-frame displacement so the two origins are never
-mixed.
+目标与观测机的几何关系发生在**共享 ENU** 系里，而 PX4 位置控制使用观测机自己的
+**local ENU** 系。下面的转换只搬运共享系中的**相对位移**，两个原点因此永不混用。
 """
 
 from __future__ import annotations
@@ -24,7 +22,7 @@ def _sub(left: Vector3, right: Vector3) -> Vector3:
 
 @dataclass(frozen=True)
 class DesiredState:
-    """Controller-facing reference in the observer's local ENU frame."""
+    """控制器的期望参考，位于观测机的 local ENU 系。"""
 
     p: Vector3 = (0.0, 0.0, 0.0)
     v: Vector3 = (0.0, 0.0, 0.0)
@@ -36,7 +34,7 @@ class DesiredState:
 
 @dataclass(frozen=True)
 class TargetState:
-    """Target kinematics expressed in the shared world ENU frame."""
+    """目标运动学状态，位于共享世界 ENU 系。"""
 
     p: Vector3
     v: Vector3 = (0.0, 0.0, 0.0)
@@ -45,7 +43,7 @@ class TargetState:
 
 @dataclass(frozen=True)
 class ObserverState:
-    """Observer position in both shared and its PX4-local ENU frames."""
+    """观测机位置，同时给出共享系与它自己的 PX4 local ENU 系坐标。"""
 
     shared_p: Vector3
     local_p: Vector3
@@ -53,13 +51,13 @@ class ObserverState:
 
 @dataclass(frozen=True)
 class PositionTrackerV0:
-    """Generate a fixed-world-offset reference from exact target state."""
+    """由目标状态生成固定世界系偏移的参考（V0 最小可用形态）。"""
 
     relative_offset: Vector3 = (-3.0, 0.0, 1.0)
     yaw: float = 0.0
 
     def generate(self, target: TargetState, observer: ObserverState) -> DesiredState:
-        """Return the observer-local desired state for the current target state."""
+        """按当前目标状态给出观测机 local 系下的期望状态。"""
 
         # 先在共享系里算出期望站位与相对误差。
         desired_shared = _add(target.p, self.relative_offset)

@@ -6,14 +6,14 @@
 # 默认不带 --execute 时为 dry-run，不会解锁或起飞。
 #
 # 常用示例：
-#   ./test/run_target_waypoints.sh --interactive --execute   # 终端手动输入航点
-#   ./test/run_target_waypoints.sh --point 3 0 2 --execute   # 脚本预设航点
+#   ./scripts/run_target_waypoints.sh --interactive --execute  # 终端手动输入航点
+#   ./scripts/run_target_waypoints.sh --point 3 0 2 --execute  # 脚本预设航点
 
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export SIMFORDRONE_ROOT="${ROOT}"
-source "${ROOT}/env/activate_px4_mavlink_control.sh"
+source "${ROOT}/scripts/env/activate_px4_mavlink_control.sh"
 
 cd "${ROOT}"
 export PYTHONPATH="${ROOT}/tracking:${ROOT}/px4ctrl"

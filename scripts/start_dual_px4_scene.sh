@@ -7,7 +7,7 @@ set -Eeuo pipefail
 SIMFORDRONE_ROOT="/data/disk2/home/hl/research/SimForDrone"
 ISAACSIM_ROOT="/data/disk2/home/hl/isaacsim-5.1.0"
 SCENE_SCRIPT="${SIMFORDRONE_ROOT}/scripts/01_dual_px4_scene.py"
-ISAAC_ENV_SCRIPT="${SIMFORDRONE_ROOT}/env/activate_isaacsim_internal_ros.sh"
+ISAAC_ENV_SCRIPT="${SIMFORDRONE_ROOT}/scripts/env/activate_isaacsim_internal_ros.sh"
 LOG_DIR="${SIMFORDRONE_ROOT}/logs/isaac_px4"
 # NvStreamer 会把 .etli 跟踪日志写到进程的当前工作目录。此前工作目录是仓库根，
 # 导致每轮启动都留下数十 MB 且持续累积；这里固定到 logs/ 下并限制保留份数。
@@ -24,6 +24,15 @@ PX4_INPUT_SCALING="${SIMFORDRONE_PX4_INPUT_SCALING:-2000}"
 ISAAC_GUI="${SIMFORDRONE_ISAAC_GUI:-0}"
 # carb 设置 /app/livestream/webrtcEtli 控制 WebRTC 跟踪记录；置 0 可关闭。
 WEBRTC_ETLI="${ISAAC_WEBRTC_ETLI:-0}"
+# 带 UI 的 WebRTC 流：默认**开启**。
+# 机制：headless（--no-window）+ hideUi=false，让 omni.ui 窗口与属性面板
+# 参与合成，从而随视频流一起发送。实测已验证 HUD 与四个视角命令均可用。
+# 注意：**不能**用 isaacsim.exp.full.streaming.kit（见 --stream-ui-full）。
+STREAM_UI="${SIMFORDRONE_ISAAC_STREAM_UI:-1}"
+# 带 UI 流的后端：base = 原应用仅解除隐藏（已验证可用）；full = 官方 streaming 应用。
+STREAM_BACKEND="${SIMFORDRONE_ISAAC_STREAM_BACKEND:-base}"
+# 官方“无窗口 + UI 随流发送”应用；本地 GUI 与 base 后端都不加载它。
+STREAM_EXPERIENCE="${ISAACSIM_ROOT}/apps/isaacsim.exp.full.streaming.kit"
 
 die() {
     echo "ERROR: $*" >&2
@@ -32,14 +41,33 @@ die() {
 
 usage() {
     cat <<'EOF'
-Usage: ./scripts/start_dual_px4_scene.sh [--gui]
+Usage: ./scripts/start_dual_px4_scene.sh [options]
 
-  --gui  Start the local Isaac Sim desktop interface. Requires an available
-         graphical display; it exposes the Stage, Property, Timeline, and
-         status-bar panels for inspecting scene objects.
+  (default)       Headless WebRTC stream with the UI composited in: the SimForDrone HUD
+                  and the Stage/Property panels are part of the video stream
+                  (hideUi=false, verified working).
+  --no-stream-ui  Stream the rendered image only. The scene then prints a 1 Hz
+                  [vehicle-state] line in this terminal instead of drawing the HUD.
+  --gui           Start the local Isaac Sim desktop interface. NOTE: the X display on this
+                  machine is not accessible (Invalid MIT-MAGIC-COOKIE-1 key), so this
+                  currently fails; use the stream modes instead.
+  --stream-ui-full
+                  EXPERIMENTAL: same as default but loads the official
+                  isaacsim.exp.full.streaming.kit. KNOWN TO SEGFAULT on this machine
+                  during extension startup (~43 s). Do not use.
+
+View commands (type in this terminal while the scene runs):
+  0 free | 1 overview | 2 target | 3 tracker | 4 onboard | v status
+  Default is 0 (free): the program never writes the camera, so you can orbit/pan
+  with the mouse. Any follow mode overrides manual camera control until you press 0.
 
 Environment overrides:
   SIMFORDRONE_PX4_INPUT_SCALING  PX4 output-to-thrust gain (default 2000)
+  SIMFORDRONE_ISAAC_STREAM_UI    0 disables the composited-UI stream (default 1)
+  SIMFORDRONE_ISAAC_STREAM_BACKEND  base (default, works) or full (crashes)
+  SIMFORDRONE_ISAAC_CONSOLE_STATE  1 forces the 1 Hz terminal [vehicle-state] line even
+                                   when the HUD is drawn (useful if your viewer cannot
+                                   play the WebRTC stream)
   ISAAC_WEBRTC_ETLI              WebRTC trace arg, informational only (default 0)
   ISAAC_ETLI_KEEP                How many .etli traces to retain (default 2)
   ISAAC_ETLI_MAX_MB              Truncate an .etli once it exceeds this (default 64)
@@ -52,10 +80,27 @@ EOF
 
 case "${1:-}" in
     "") ;;
-    --gui) ISAAC_GUI=1 ;;
+    --gui) ISAAC_GUI=1; STREAM_UI=0 ;;
+    --stream-ui) STREAM_UI=1; STREAM_BACKEND="base" ;;
+    --stream-ui-full) STREAM_UI=1; STREAM_BACKEND="full" ;;
+    --no-stream-ui) STREAM_UI=0 ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; die "Unknown argument: $1" ;;
 esac
+
+# 本地桌面与带 UI 流都需要绘制 UI；纯画面流则不需要。
+if [[ "${ISAAC_GUI}" == "1" || "${STREAM_UI}" == "1" ]]; then
+    ISAAC_UI=1
+else
+    ISAAC_UI=0
+fi
+# 只有 headless + 带 UI 流 + full 后端才指定 streaming 应用：
+# base 后端沿用原应用，仅把 hideUi 置为 false。
+ISAAC_EXPERIENCE=""
+if [[ "${ISAAC_GUI}" != "1" && "${STREAM_UI}" == "1" && "${STREAM_BACKEND}" == "full" ]]; then
+    [[ -f "${STREAM_EXPERIENCE}" ]] || die "Streaming experience not found: ${STREAM_EXPERIENCE}"
+    ISAAC_EXPERIENCE="${STREAM_EXPERIENCE}"
+fi
 
 [[ -x "${ISAACSIM_ROOT}/python.sh" ]] || die "Isaac Sim Python not found: ${ISAACSIM_ROOT}/python.sh"
 [[ -f "${SCENE_SCRIPT}" ]] || die "Dual-scene script not found: ${SCENE_SCRIPT}"
@@ -93,7 +138,8 @@ Starting Pegasus dual-PX4 scene
   PX4:       ${SIMFORDRONE_ROOT}/PX4-Autopilot
   ROS 2:     Jazzy internal rclpy + Fast DDS
   PX4 gain:  ${PX4_INPUT_SCALING}
-  Isaac UI:  $([[ "${ISAAC_GUI}" == "1" ]] && echo enabled || echo disabled)
+  Isaac UI:  $([[ "${ISAAC_UI}" == "1" ]] && echo "enabled (HUD; backend=${STREAM_BACKEND})" || echo "disabled (image only, terminal [vehicle-state] active)")
+  View cmd:  0 free | 1 overview | 2 target | 3 tracker | 4 onboard | v status
   WebRTC:    ${PUBLIC_ENDPOINT}:${STREAM_PORT}
   WebRTC trace (etli): ${WEBRTC_ETLI} -> ${ETLI_DIR}（单文件上限 ${ETLI_MAX_MB} MB）
   Log:       ${LOG_FILE}
@@ -130,7 +176,7 @@ trap stop_etli_guard EXIT INT TERM
 
 # 在子 shell 中加载 Isaac 专用环境，避免它反向污染用户当前 SSH 终端。
 (
-    export SIMFORDRONE_ROOT ISAACSIM_ROOT SIMFORDRONE_PX4_INPUT_SCALING="${PX4_INPUT_SCALING}" SIMFORDRONE_ISAAC_GUI="${ISAAC_GUI}"
+    export SIMFORDRONE_ROOT ISAACSIM_ROOT SIMFORDRONE_PX4_INPUT_SCALING="${PX4_INPUT_SCALING}" SIMFORDRONE_ISAAC_GUI="${ISAAC_GUI}" SIMFORDRONE_ISAAC_UI="${ISAAC_UI}" SIMFORDRONE_ISAAC_EXPERIENCE="${ISAAC_EXPERIENCE}"
     source "${ISAAC_ENV_SCRIPT}"
     # 切换到 logs/ 下的专用目录，使 .etli 不再落到仓库根。
     cd "${ETLI_DIR}"

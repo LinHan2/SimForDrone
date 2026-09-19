@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+import math
 import time
 
 import carb
@@ -60,18 +61,49 @@ class DualUavObservationApp:
         self.world.reset()
         # WebRTC 全局观察相机，仅供人眼查看；它不等于跟随机机载传感器。
         self.pg.set_viewport_camera(self.config["viewport"]["position"], self.config["viewport"]["target"])
-        # GUI 监视窗只在本地桌面模式创建：headless/WebRTC 下 omni.ui 会初始化失败，
-        # 因此该分支延迟导入，保证无窗口服务器仍能正常启动场景。
+        # UI 是否绘制：本地桌面（--gui）与“带 UI 的 WebRTC 流”都需要它；
+        # 纯画面流不能绘制 omni.ui，因此这里按开关决定是否导入，
+        # 避免在无窗口且无 UI 合成的环境下初始化 UI 扩展而报错。
+        self.ui_enabled = os.environ.get("SIMFORDRONE_ISAAC_UI", "0") == "1"
+        # UI 已启用时默认不再往终端刷状态（信息已在画面上）；若观看端无法播放
+        # 视频流，可用 SIMFORDRONE_ISAAC_CONSOLE_STATE=1 强制保留终端输出。
+        self.console_state = not self.ui_enabled or (
+            os.environ.get("SIMFORDRONE_ISAAC_CONSOLE_STATE", "0") == "1"
+        )
         self.vehicle_monitor = None
-        if os.environ.get("SIMFORDRONE_ISAAC_GUI", "0") == "1":
-            from simfordrone.vehicle_monitor import VehicleMonitorWindow
+        self.view_control = None
+        if self.ui_enabled:
+            # 相机扫描只为机载视角切换服务，非 UI 模式下不做：
+            # 否则会打印“target 未找到机载相机”，而 target 本来就没挂相机，产生误导。
+            self._register_camera_paths()
+            try:
+                from simfordrone.vehicle_monitor import VehicleHudWindow
+                from simfordrone.view_control import HELP_LINES, ViewControl
 
-            self.vehicle_monitor = VehicleMonitorWindow(self.vehicles)
+                # 机载视角只对 tracker 存在（target 未挂相机），缺失时 ViewControl 会退回跟随视角。
+                tracker_camera = self.vehicles["tracker"].get("camera_prim_path")
+                self.view_control = ViewControl(self.vehicles, onboard_camera_path=tracker_camera)
+                self.vehicle_monitor = VehicleHudWindow(self.vehicles, self.view_control)
+                print("[ui] HUD 已叠加到视频流；视角控制可用：", flush=True)
+                for line in HELP_LINES:
+                    print("  " + line, flush=True)
+            except Exception as error:
+                # UI 出错必须降级而不是让场景崩溃：曾因 HUD 里的 AttributeError
+                # 逃逸出 __init__，导致 Isaac 在退出阶段段错误、整个场景不可用。
+                # 这里关掉 UI 开关，主循环会自动回到终端 1 Hz 状态输出。
+                print(f"[ui] HUD/视角控制创建失败，降级为终端输出：{error}", flush=True)
+                self.ui_enabled = False
+                self.view_control = None
+                self.vehicle_monitor = None
         # headless 模式没有可交互面板，改用终端周期输出同样的两机状态，
         # 使 WebRTC 用户也能核对物体位置而不仅看到画面。
         self._next_console_status = time.monotonic()
         # 监视窗单独节流到 10 Hz：物理步进远高于此，逐帧更新 UI 模型只是浪费渲染时间。
         self._next_monitor_update = time.monotonic()
+        # 操作员命令轮询节流（同 10 Hz）。
+        self._next_command_poll = time.monotonic()
+        # 相机 prim 可能晚于场景构建才出现，因此保留一个低频重扫节流点。
+        self._next_camera_scan = time.monotonic()
         self.stop_sim = False
 
     def _create_vehicle(
@@ -135,6 +167,29 @@ class DualUavObservationApp:
             "mavlink_port": 14540 + vehicle_id,
         }
 
+    def _register_camera_paths(self) -> None:
+        """在 stage 中查找各载具挂载的相机 prim，供机载视角切换使用。
+
+        Pegasus 用 ``get_stage_next_free_path`` 生成相机路径，同名时可能追加后缀，
+        因此不能写死 ``<vehicle>/body/<camera>``，必须实际遍历确认。
+        """
+
+        from pxr import UsdGeom
+
+        stage = self.world.stage
+        for role, entry in self.vehicles.items():
+            prefix = str(entry["stage_path"]) + "/"
+            entry["camera_prim_path"] = None
+            for prim in stage.Traverse():
+                path = str(prim.GetPath())
+                if not path.startswith(prefix):
+                    continue
+                if prim.IsA(UsdGeom.Camera):
+                    entry["camera_prim_path"] = path
+                    break
+            if entry["camera_prim_path"] is None:
+                print(f"[ui] {role} 未找到机载相机 prim", flush=True)
+
     def _camera_config(self) -> dict:
         """把 YAML 的人类可读字段转换为 Pegasus 传感器字段。"""
 
@@ -153,22 +208,45 @@ class DualUavObservationApp:
         self.timeline.play()
         while self.simulation_app.is_running() and not self.stop_sim:
             self.world.step(render=True)
-            # 监视窗读取的是 Pegasus 自己维护的 vehicle.state（Isaac 世界系 ENU），
-            # 不引入第二套位姿来源，避免与飞控 EKF 估计混淆。
+            # 视角必须在每个仿真步重新应用：跟随模式要求相机连续跟随载具运动。
             now = time.monotonic()
+            if self.view_control is not None:
+                self.view_control.apply()
+                # 命令轮询单独节流到 10 Hz：stdin 读取无需跟随帧率。
+                if now >= self._next_command_poll:
+                    for message in self.view_control.poll_stdin():
+                        print(message, flush=True)
+                    self._next_command_poll = now + 0.1
+                # 机载相机 prim 可能晚于场景构建才由传感器 start() 创建，
+                # 因此只要 tracker 还没拿到路径就低频重扫一次。
+                if self.vehicles["tracker"].get("camera_prim_path") is None and now >= self._next_camera_scan:
+                    self._register_camera_paths()
+                    self.view_control.set_onboard_camera_path(
+                        self.vehicles["tracker"].get("camera_prim_path")
+                    )
+                    self._next_camera_scan = now + 2.0
+            # HUD 读取的是 Pegasus 自己维护的 vehicle.state（Isaac 世界系 ENU），
+            # 不引入第二套位姿来源，避免与飞控 EKF 估计混淆。
             if self.vehicle_monitor is not None and now >= self._next_monitor_update:
                 self.vehicle_monitor.update()
                 self._next_monitor_update = now + 0.1
             # 终端状态按 1 Hz 节流输出：物理步进频率远高于此，逐帧打印会淹没日志。
-            if now >= self._next_console_status:
+            if self.console_state and now >= self._next_console_status:
+                # 除两机位置外还给出速度模长与两机间距：跟踪实验首先关心的就是
+                # 相对几何是否维持，间距比六个坐标分量更直接。
+                states = {role: entry["vehicle"].state for role, entry in self.vehicles.items()}
                 fields = []
-                for role, entry in self.vehicles.items():
-                    state = entry["vehicle"].state
+                for role, state in states.items():
+                    position = state.position
+                    velocity = state.linear_velocity
+                    speed = math.sqrt(sum(float(component) ** 2 for component in velocity))
                     fields.append(
-                        f"{role}: p=({state.position[0]:+.2f},{state.position[1]:+.2f},"
-                        f"{state.position[2]:+.2f}) v=({state.linear_velocity[0]:+.2f},"
-                        f"{state.linear_velocity[1]:+.2f},{state.linear_velocity[2]:+.2f})"
+                        f"{role}: p=({position[0]:+.2f},{position[1]:+.2f},{position[2]:+.2f}) "
+                        f"|v|={speed:.2f}"
                     )
+                if len(states) == 2:
+                    first, second = states.values()
+                    fields.append(f"gap={math.dist(first.position, second.position):.2f}m")
                 print("[vehicle-state] " + " | ".join(fields), flush=True)
                 self._next_console_status = now + 1.0
 

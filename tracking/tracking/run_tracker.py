@@ -1,4 +1,4 @@
-"""Run only the tracker UAV using target state published by another process."""
+"""只控制 tracker：消费另一进程发布的目标状态并执行 V0 相对位置跟踪。"""
 
 from __future__ import annotations
 
@@ -71,7 +71,7 @@ def wait_target_state(subscriber: TargetStateSubscriber, timeout: float, freshne
             return subscriber.require_fresh(time.monotonic(), freshness)
         except RuntimeError:
             time.sleep(0.02)
-    raise RuntimeError("未收到新鲜 target 状态；请先启动 test/run_target_waypoints.sh")
+    raise RuntimeError("未收到新鲜 target 状态；请先启动 scripts/run_target_waypoints.sh")
 
 
 def command_from_reference(reference) -> CommandData:
@@ -183,7 +183,7 @@ def main() -> int:
         record["samples"] = samples[:: max(1, len(samples) // 300)]
         record["error_mean_m"] = sum(sample["error"] for sample in samples) / len(samples)
         record["error_max_m"] = max(sample["error"] for sample in samples)
-        record.update(finish(link, fsm, defaults.landing_timeout, print))
+        record.update(finish(link, fsm, defaults.landing_timeout, print, defaults.disarm_timeout))
         passed = bool(record.get("on_ground")) and bool(record.get("disarmed"))
         record["passed"] = passed
         record["result"] = "completed"
@@ -193,14 +193,14 @@ def main() -> int:
         record["result"] = "interrupted"
         print("INTERRUPT: tracker 正在安全降落", file=sys.stderr)
         if fsm.stream_enabled:
-            record.update(finish(link, fsm, defaults.landing_timeout, print))
+            record.update(finish(link, fsm, defaults.landing_timeout, print, defaults.disarm_timeout))
         return 130
     except Exception as error:
         record["result"] = "failed"
         record["error"] = str(error)
         print(f"FAIL: {error}", file=sys.stderr)
         if fsm.stream_enabled:
-            record.update(finish(link, fsm, defaults.landing_timeout, print))
+            record.update(finish(link, fsm, defaults.landing_timeout, print, defaults.disarm_timeout))
         return 1
     finally:
         output_dir.mkdir(parents=True, exist_ok=True)

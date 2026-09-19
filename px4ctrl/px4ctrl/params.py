@@ -32,7 +32,13 @@ class TakeoffLandParams:
 
 @dataclass(frozen=True)
 class ThrustModelParams:
-    """``thrust_model`` 段：把归一化推力信号 u(0~1) 映射为真实推力。"""
+    """``thrust_model`` 段：把归一化推力信号 u(0~1) 映射为真实推力。
+
+    注意 ``accurate``：它是**上游遗留开关**——上游 ``px4ctrl`` 同样只从 YAML 读取、
+    从不使用（已核对 ``Fast-Gamma/.../PX4CtrlParam.cpp`` 与 ``controller.cpp``，仅赋值无
+    读取）。本移植保留它只为让 YAML 与上游逐字段可比，**不参与任何计算**。
+    真正影响行为的是下面两个新开关。
+    """
 
     accurate: bool = True
     print_value: bool = False
@@ -40,6 +46,37 @@ class ThrustModelParams:
     k2: float = 1.6942
     k3: float = 0.6786
     hover_percentage: float = 0.30
+    #: 是否补偿倾斜造成的垂向推力损失（推力除以 cosφ·cosθ）。默认开启。
+    tilt_compensation: bool = True
+    #: 是否启用带遗忘因子的 RLS 在线估计 ``thr2acc``（即油门/推力模型）。
+    #: 上游在 AUTO_HOVER 与 CMD_CTRL 每周期都调用它；本移植把调用点显式化并交由本
+    #: 开关控制。仿真默认关闭（已有一份可追溯的静态标定）；原机需要在线油门模型时
+    #: 打开，但请同时保证控制频率满足下面的配对窗口要求。
+    online_estimate: bool = False
+    #: 配对延迟窗口（秒）：推力指令与它产生的加速度之间的执行器+传输滞后。默认与
+    #: 上游一致（35~45 ms）。**控制周期必须显著小于窗口下限**，否则窗口内永远没有
+    #: 样本，只能依赖降级配对（20 Hz = 50 ms 周期就是这种情况）。
+    estimate_delay_min_s: float = 0.035
+    estimate_delay_max_s: float = 0.045
+    #: 窗口内无样本时是否退化为“使用最近的可用样本”。
+    #: 降级配对在悬停/慢速飞行下几乎无偏（推力近似恒定），激烈机动时会引入
+    #: 配对滞后偏差，因此高控制频率仍是首选。
+    estimate_allow_degraded: bool = True
+    #: ``thr2acc`` 的允许范围，以初始标定值 ``gra/hover_percentage`` 为倍数。
+    #: 超出范围的更新会被**拒绝**并计数：不加限制时，IMU 加速度符号/坐标系接错、
+    #: 或标定差一个数量级，RLS 会把推力模型拉到任意值而没有任何征兆。
+    estimate_min_ratio: float = 0.5
+    estimate_max_ratio: float = 2.0
+
+    def __post_init__(self) -> None:
+        if self.hover_percentage <= 0.0 or self.hover_percentage > 1.0:
+            raise ParamError(f"hover_percentage 必须落在 (0, 1]，实际为 {self.hover_percentage}")
+        if self.estimate_delay_min_s <= 0.0:
+            raise ParamError("estimate_delay_min_s 必须为正数")
+        if self.estimate_delay_max_s <= self.estimate_delay_min_s:
+            raise ParamError("estimate_delay_max_s 必须大于 estimate_delay_min_s")
+        if self.estimate_min_ratio <= 0.0 or self.estimate_max_ratio <= self.estimate_min_ratio:
+            raise ParamError("推力模型允许范围必须满足 0 < estimate_min_ratio < estimate_max_ratio")
 
 
 @dataclass(frozen=True)
@@ -216,6 +253,13 @@ def load_params(path: str | Path) -> Params:
             k2=float(tm.get("K2", 1.6942)),
             k3=float(tm.get("K3", 0.6786)),
             hover_percentage=float(tm.get("hover_percentage", 0.30)),
+            tilt_compensation=bool(tm.get("tilt_compensation", True)),
+            online_estimate=bool(tm.get("online_estimate", False)),
+            estimate_delay_min_s=float(tm.get("estimate_delay_min_s", 0.035)),
+            estimate_delay_max_s=float(tm.get("estimate_delay_max_s", 0.045)),
+            estimate_allow_degraded=bool(tm.get("estimate_allow_degraded", True)),
+            estimate_min_ratio=float(tm.get("estimate_min_ratio", 0.5)),
+            estimate_max_ratio=float(tm.get("estimate_max_ratio", 2.0)),
         ),
         gain=GainParams(
             kp0=float(gain.get("Kp0", 6.0)),

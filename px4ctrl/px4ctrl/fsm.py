@@ -14,16 +14,19 @@
 
 安全策略
 --------
-- 任何输入超时都不得继续控制：里程计缺失直接转 ``AUTO_LAND``，IMU 缺失则退化为仅用
-  期望姿态（由 :class:`~px4ctrl.controller.LinearControl` 处理），状态机本身不再发散点。
+- 任何输入超时都不得继续控制：里程计缺失直接退出控制，制导指令停更则退出
+  ``CMD_CTRL`` 回到悬停（而不是带着最后一条陈旧设定点一直飞），IMU 缺失则退化为
+  仅用期望姿态（由 :class:`~px4ctrl.controller.LinearControl` 处理）。
 - 每个周期都会检查是否仍在 Offboard；掉出则记录并尝试复位，不静默继续。
-- 与上游一致：``MOTORS_SPEEDUP_TIME`` 内电机怠速，``DELAY_TRIGGER_TIME`` 到达目标高度
+- 与上游一致：``MOTORS_SPEEDUP_TIME`` 内电机怆速，``DELAY_TRIGGER_TIME`` 到达目标高度
   后停顿，避免起飞瞬间的推力突变。
 """
 
 from __future__ import annotations
 
 import math
+import time
+from dataclasses import replace
 from enum import IntEnum
 from typing import Callable, Optional
 
@@ -47,6 +50,13 @@ class State(IntEnum):
 HANDOVER_TOLERANCE_M = 0.10
 #: 超出延时后仍不满足容差时的最长等待（s）；超时按实测位置交接，避免卡在起飞态。
 HANDOVER_TIMEOUT_S = 10.0
+#: 推力模型日志的打印周期（s），仅当 ``thrust_model.print_value`` 为真时生效。
+THRUST_LOG_PERIOD_S = 5.0
+#: 判定“IMU 加速度符号/坐标系可疑”所需的最少负值样本数。
+NEGATIVE_ACCEL_WARN_SAMPLES = 20
+#: CMD_CTRL 的倾角持续受限超过该时长即回退悬停。一个正常的短暂限幅不触发；持续
+#: 饱和意味着当前位置环无法实现制导加速度，继续追踪只会累积位置误差并放大风险。
+TILT_SATURATION_HOVER_DELAY_S = 0.5
 
 
 class PX4CtrlFSM:
@@ -76,6 +86,12 @@ class PX4CtrlFSM:
         #: 是否持续下发设定点。Offboard 下中断即 failsafe，因此默认开启。
         self.stream_enabled = False
         self.last_cycle = 0.0
+
+        # 在线推力估计与推力模型日志的一次性告警/节流状态。
+        self._thrust_imu_warned = False
+        self._thrust_sign_warned = False
+        self._thrust_log_due = 0.0
+        self._tilt_saturation_started_at: float | None = None
 
     # -------------------------------------------------------------- 生命周期
 
@@ -122,12 +138,22 @@ class PX4CtrlFSM:
     def request_command_control(self) -> None:
         """把控制权交给制导层（``CMD_CTRL``）。"""
 
+        self._tilt_saturation_started_at = None
         self.state = State.CMD_CTRL
         self._log("CMD_CTRL：开始跟踪制导指令")
 
-    def set_command(self, command: CommandData) -> None:
-        """更新制导指令（对应上游 ``/position_cmd`` 订阅）。"""
+    def set_command(self, command: CommandData, now: float | None = None) -> None:
+        """更新制导指令（对应上游 ``/position_cmd`` 订阅）。
 
+        到达时刻**在本函数内统一盖章**：每个制导调用点都必须让状态机知道“这条指令
+        是什么时候到的”，靠调用方各自传 ``recv_time`` 早晚会漏（实测有两处漏传，
+        导致 ``MSG_TIMEOUT_CMD`` 形同虚设）。外部已给同进程时钟的 ``recv_time`` 时
+        尊重它，否则补当前单调时钟。
+        """
+
+        if command.recv_time <= 0.0:
+            stamp = time.monotonic() if now is None else now
+            command = replace(command, recv_time=stamp)
         self.command = command
 
     def _set_hover_from_odom(self) -> None:
@@ -140,6 +166,13 @@ class PX4CtrlFSM:
         return DesiredState(p=self.hover_pose, yaw=self.hover_yaw)
 
     def _command_desired(self) -> DesiredState:
+        """制导层的期望状态。
+
+        ``j``/``yaw_rate`` 只做透传（与上游一致）：当前控制律不使用加加速度，
+        ``yaw_rate`` 仅在 ``use_bodyrate_ctrl`` 的角速度模式下才会被使用，而本移植
+        只用姿态+推力设定点。保留它们是为了让制导层的接口契约不变。
+        """
+
         cmd = self.command
         return DesiredState(p=cmd.p, v=cmd.v, a=cmd.a, j=cmd.j, yaw=cmd.yaw, yaw_rate=cmd.yaw_rate)
 
@@ -240,6 +273,29 @@ class PX4CtrlFSM:
             self.last_output = ControllerOutput()
             return self.last_output
 
+        # 制导指令新鲜度：CMD_CTRL 完全依赖制导层，指令停更时继续飞下去就会永久
+        # 用同一条陈旧设定点（制导进程崩溃、卡死或减速都会触发）。降级为悬停而不是
+        # 立即降落：跟踪任务被中断不等于飞行器应当立即落地。
+        if self.state == State.CMD_CTRL and not self.command.is_fresh(now, self.params.timeouts.cmd):
+            age = now - self.command.recv_time if self.command.recv_time > 0.0 else float("inf")
+            self._log(
+                f"WARN: 制导指令超时 {age:.3f}s（门限 {self.params.timeouts.cmd:.3f}s），"
+                "转 AUTO_HOVER 悬停"
+            )
+            self.request_hover(now)
+
+        # 在线推力模型估计（上游在 AUTO_HOVER/CMD_CTRL 每周期调用）。必须放在
+        # calculate_control 之前：它要用上一周期存入的推力历史与本周期的加速度配对。
+        if self.params.thrust_model.online_estimate and self.state in (
+            State.AUTO_HOVER,
+            State.CMD_CTRL,
+        ):
+            self._update_thrust_estimate(now)
+
+        # 推力模型日志：``print_value`` 为真时周期打印（真机标定时用它看收敛）。
+        if self.params.thrust_model.print_value:
+            self._log_thrust_model(now)
+
         if self.state == State.AUTO_LAND:
             self._detect_landed()
 
@@ -247,6 +303,26 @@ class PX4CtrlFSM:
         output = self.controller.calculate_control(
             des, self.link.odom, self.link.imu, self.last_output, now=now
         )
+
+        # 只监测制导控制：起飞/降落阶段可能因任务本身短暂接近上限，不能把它们误判为
+        # 制导故障。控制器提供的是限幅**前**的显式标记，避免“恰好等于上限”的误判。
+        if self.state == State.CMD_CTRL and self.controller.debug.tilt_saturated:
+            if self._tilt_saturation_started_at is None:
+                self._tilt_saturation_started_at = now
+            elif now - self._tilt_saturation_started_at >= TILT_SATURATION_HOVER_DELAY_S:
+                duration = now - self._tilt_saturation_started_at
+                self._log(
+                    f"WARN: 倾角持续饱和 {duration:.3f}s（阈值 "
+                    f"{TILT_SATURATION_HOVER_DELAY_S:.3f}s），转 AUTO_HOVER 悬停"
+                )
+                self.request_hover(now)
+                self._tilt_saturation_started_at = None
+                # 本周期也必须立即改发悬停输出，不能再多发一次已饱和的制导设定点。
+                output = self.controller.calculate_control(
+                    self._hover_desired(), self.link.odom, self.link.imu, output, now=now
+                )
+        else:
+            self._tilt_saturation_started_at = None
 
         # 归一化推力必须落在 [0, 1]，否则 PX4 端行为未定义。
         output.thrust = max(0.0, min(1.0, output.thrust))
@@ -262,6 +338,49 @@ class PX4CtrlFSM:
         if self.stream_enabled:
             self.link.send_attitude_thrust(self.last_output.q, self.last_output.thrust)
         self.link.pump()
+
+    # -------------------------------------------------------------- 推力模型
+
+    def _update_thrust_estimate(self, now: float) -> None:
+        """按配置调用在线推力估计，并对缺少 IMU / 符号可疑给出一次性告警。"""
+
+        if self.link.imu.recv_time <= 0.0:
+            # 没有 HIGHRES_IMU 就无法估计：显式告警，而不是静默不工作。
+            if not self._thrust_imu_warned:
+                self._thrust_imu_warned = True
+                self._log("WARN: 未收到 HIGHRES_IMU，在线推力估计无法进行（检查链路报文流）")
+            return
+
+        self.controller.estimate_thrust_model(self.link.imu.acc, now)
+        stats = self.controller.estimate_stats
+        if stats.negative_accel >= NEGATIVE_ACCEL_WARN_SAMPLES and not self._thrust_sign_warned:
+            self._thrust_sign_warned = True
+            self._log(
+                "WARN: 机体 z 轴比力持续为负（"
+                f"{stats.negative_accel} 次）：IMU 加速度的符号/坐标系可能接错，"
+                "应为 FLU 的比力（悬停时约为 +g）"
+            )
+
+    def _log_thrust_model(self, now: float) -> None:
+        """周期打印推力模型与其估计统计（仅 ``thrust_model.print_value`` 打开时）。
+
+        上游把这两个开关的语义留得很模糊（``print_value`` 实际上只会在加载时提醒你
+        “该关掉”）；这里给它一个明确作用：真机标定时用它观察 ``thr2acc`` 的收敛过程。
+        """
+
+        if now < self._thrust_log_due:
+            return
+        self._thrust_log_due = now + THRUST_LOG_PERIOD_S
+        stats = self.controller.estimate_stats
+        initial = self.params.gra / self.params.thrust_model.hover_percentage
+        online = "开" if self.params.thrust_model.online_estimate else "关"
+        self._log(
+            f"[thrust-model] thr2acc={self.controller.thrust_to_accel:.3f} "
+            f"(标定初值 {initial:.3f}, hover_percentage 反算 "
+            f"{self.controller.suggested_hover_percentage():.4f}) 在线估计={online} "
+            f"更新={stats.updates} 拒绝={stats.rejected} 空窗={stats.no_sample} "
+            f"降级={stats.degraded} 控制周期={self.controller.estimate_period_s * 1000.0:.1f}ms"
+        )
 
     # ------------------------------------------------------------------ 工具
 

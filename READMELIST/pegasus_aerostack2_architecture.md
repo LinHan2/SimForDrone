@@ -329,8 +329,8 @@ flowchart LR
 | `scripts/01_dual_px4_scene.py` | 双机场景轻量入口（启用 WebRTC + ROS 2 bridge 后交给 `src/simfordrone`） |
 | `src/simfordrone/dual_uav_observation.py` | 项目自有的双机场景定义（含推力标定） |
 | `src/simfordrone/pegasus_compat.py` | 不改第三方源码的兼容层（补深度图 writer 标记） |
-| `env/activate_isaacsim_internal_ros.sh` | Isaac 内部 Jazzy 环境，仅限子进程，与系统 ROS 隔离 |
-| `env/activate_system_ros2_jazzy.sh` | 系统 ROS 2 Jazzy，用于验收/算法终端 |
+| `scripts/env/activate_isaacsim_internal_ros.sh` | Isaac 内部 Jazzy 环境，仅限子进程，与系统 ROS 隔离 |
+| `scripts/env/activate_system_ros2_jazzy.sh` | 系统 ROS 2 Jazzy，用于验收/算法终端 |
 | `aerostack2/` | 上游 Aerostack2 纯净副本，面向后续控制闭环集成 |
 
 ---

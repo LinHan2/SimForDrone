@@ -32,10 +32,14 @@ SimForDrone/
 （T5）。视觉模块不得直接调用 `px4ctrl`，避免感知误差与控制误差互相掩盖。
 
 所有项目模块变更必须更新 [项目进度](READMELIST/progress.md)；运行命令集中在
-[运行手册](READMELIST/runbook.md)。
+[运行手册](READMELIST/runbook.md)，而“命令到无人机之间的完整调用链、环境画像、
+进程间通信与端口归属”见 [调用关系整理](READMELIST/invocation_map.md)。
 
-`env/activate_isaacsim_internal_ros.sh` 只能由 Isaac 启动脚本在子进程中加载；
-`env/activate_system_ros2_jazzy.sh` 只能在验收或算法终端加载。二者不能在同一进程混用。
+`scripts/env/activate_isaacsim_internal_ros.sh` 只能由 Isaac 启动脚本在子进程中加载；
+`scripts/env/activate_system_ros2_jazzy.sh` 只能在验收或算法终端加载。二者不能在同一进程混用。
+
+所有 shell 脚本（启动入口与环境 profile）都集中在 `scripts/`，不要再把脚本放回仓库根或
+其它目录。
 
 ## 当前检查点：双机观测
 
@@ -49,7 +53,7 @@ SimForDrone/
 
 ```bash
 cd /data/disk2/home/hl/research/SimForDrone
-./utils/check_dual_uav_observation.sh
+./scripts/check_dual_uav_observation.sh
 ```
 
 预期有两台 PX4（`vehicle_id=0,1`）及以下 ROS 2 主题：目标机/跟踪机位姿，跟踪机前视 RGB、相机内参和深度图。详见 [运行手册](READMELIST/runbook.md)。

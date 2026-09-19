@@ -2,14 +2,15 @@
 # ROS 2 <-> PX4/Gazebo unified launcher for SimForDrone.
 #
 # Typical flow:
-#   ./start_ros2_px4.sh build
-#   ./start_ros2_px4.sh start          # headless (default)
-#   ./start_ros2_px4.sh test
-#   ./start_ros2_px4.sh attach px4     # interactive PX4 shell
-#   ./start_ros2_px4.sh stop
+#   ./scripts/start_ros2_px4.sh build
+#   ./scripts/start_ros2_px4.sh start          # headless (default)
+#   ./scripts/start_ros2_px4.sh test
+#   ./scripts/start_ros2_px4.sh attach px4     # interactive PX4 shell
+#   ./scripts/start_ros2_px4.sh stop
 set -euo pipefail
 
-PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 本脚本位于 scripts/ 下，项目根是它的上一级目录。
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PX4_DIR="${PX4_DIR:-${PROJECT_DIR}/PX4-Autopilot}"
 ROS2_WS="${ROS2_WS:-${PROJECT_DIR}/../IsaacDrone/ros2_ws}"
 ROS_DISTRO="${ROS_DISTRO:-jazzy}"
@@ -22,7 +23,7 @@ PX4_SESSION="px4_gazebo"
 
 usage() {
   cat <<'EOF'
-Usage: ./start_ros2_px4.sh <command> [options]
+Usage: ./scripts/start_ros2_px4.sh <command> [options]
 
 Commands:
   build             Build px4_msgs and Micro XRCE-DDS Agent

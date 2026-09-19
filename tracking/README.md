@@ -77,15 +77,15 @@ PYTHONPATH=tracking python -m unittest discover -s tracking/tests -v
 场景启动后，先执行 dry-run，只检查两机 heartbeat、落地状态和共享 ENU：
 
 ```bash
-./test/run_target_waypoints.sh   # 终端 1：target 发布状态（dry-run）
-./test/run_tracker.sh             # 终端 2：tracker 订阅状态（dry-run）
+./scripts/run_target_waypoints.sh   # 终端 1：target 发布状态（dry-run）
+./scripts/run_tracker.sh            # 终端 2：tracker 订阅状态（dry-run）
 ```
 
 tracker 的 dry-run 需要 target 端同时在发布状态。正式飞行见
-[test/README.md](../test/README.md)，其中 target 与 tracker 是两个独立进程：
+[scripts/README.md](../scripts/README.md)，其中 target 与 tracker 是两个独立进程：
 
-- `test/run_target_waypoints.sh --interactive --execute`：手动输入航点；
-- `test/run_tracker.sh --duration 0 --execute`：持续跟踪直到中断或目标状态超时。
+- `scripts/run_target_waypoints.sh --interactive --execute`：手动输入航点；
+- `scripts/run_tracker.sh --duration 0 --execute`：持续跟踪直到中断或目标状态超时。
 
 早期单进程双机入口（同时控制两机，固定静止目标）仍可用：
 

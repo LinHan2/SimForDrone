@@ -17,10 +17,19 @@ auto_takeoff_land:
 
 thrust_model:
   print_value: false
+  # 上游遗留开关：上游 px4ctrl 也只读取、从不使用（仅赋值无读取），保留以保持与上游
+  # 逐字段可比，**不参与任何计算**。
   accurate_thrust_model: true
   K1: 0.7583
   K2: 1.6942
   K3: 0.6786
+  # 是否补偿倾斜造成的垂向推力损失（thrust /= cosφ·cosθ）。
+  # 关闭后 25° 倾角会缺 9.4% 垂向推力，配合 Kp2=5 会留下约 0.18 m 稳态高度偏差。
+  tilt_compensation: true
+  # 是否启用 RLS 在线修正 thr2acc。上游在 AUTO_HOVER/CMD_CTRL 每周期都调用，
+  # 仿真里**保持关闭**：thr2acc 已由下方悬停标定给出且可追溯，在线修正只会让这个
+  # 已准确的量随 EKF 加速度漂移。与 tilt_compensation 不应同时开启。
+  online_estimate: false
   # ---- 已标定值，直接复用，不要每次重跑标定 ----
   # 本控制律中 thrust = des_a_z / thr2acc，而 thr2acc = gra / hover_percentage，
   # 因此**悬停时的推力指令恰好等于该值**，它是控制器唯一的推力标定量。
@@ -85,6 +94,9 @@ shared_frame:
 tasks:
   altitude: 2.0
   hold_seconds: 30.0
+  # 20 Hz（50 ms 周期）是已被实飞验证的频率；注意它大于在线推力模型的配对窗口
+  # （35~45 ms），因此开 online_estimate 时只能降级配对。若要用严格窗口，
+  # 用 --rate-hz 50 运行标定任务。
   rate_hz: 20.0
   ready_timeout: 60.0
   landing_timeout: 60.0

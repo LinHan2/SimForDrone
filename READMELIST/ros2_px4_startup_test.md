@@ -4,13 +4,13 @@
 
 ```bash
 cd /data/disk2/home/hl/research/SimForDrone
-./start_ros2_px4.sh <command>
+./scripts/start_ros2_px4.sh <command>
 ```
 
 ## 首次构建
 
 ```bash
-./start_ros2_px4.sh build
+./scripts/start_ros2_px4.sh build
 ```
 
 该步骤在 `../IsaacDrone/ros2_ws` 中构建：
@@ -23,7 +23,7 @@ cd /data/disk2/home/hl/research/SimForDrone
 服务器批量/接口开发默认使用Headless：
 
 ```bash
-./start_ros2_px4.sh start
+./scripts/start_ros2_px4.sh start
 ```
 
 脚本严格按以下顺序启动：
@@ -37,7 +37,7 @@ cd /data/disk2/home/hl/research/SimForDrone
 通过ToDesk临时查看Gazebo GUI时：
 
 ```bash
-./start_ros2_px4.sh start --gui
+./scripts/start_ros2_px4.sh start --gui
 ```
 
 GUI模式会强制选择NVIDIA GLX，避免回退到Mesa `llvmpipe`。正式运行仍推荐Headless。
@@ -45,8 +45,8 @@ GUI模式会强制选择NVIDIA GLX，避免回退到Mesa `llvmpipe`。正式运�
 ## 状态检查与通信验收
 
 ```bash
-./start_ros2_px4.sh status
-./start_ros2_px4.sh test
+./scripts/start_ros2_px4.sh status
+./scripts/start_ros2_px4.sh test
 ```
 
 `test`自动兼容PX4当前的版本化话题，例如：
@@ -70,8 +70,8 @@ GUI模式会强制选择NVIDIA GLX，避免回退到Mesa `llvmpipe`。正式运�
 ## 观察终端
 
 ```bash
-./start_ros2_px4.sh attach agent
-./start_ros2_px4.sh attach px4
+./scripts/start_ros2_px4.sh attach agent
+./scripts/start_ros2_px4.sh attach px4
 ```
 
 从tmux退出但不终止进程：按 `Ctrl-b`，再按 `d`。
@@ -79,14 +79,14 @@ GUI模式会强制选择NVIDIA GLX，避免回退到Mesa `llvmpipe`。正式运�
 查看保存日志：
 
 ```bash
-./start_ros2_px4.sh logs agent
-./start_ros2_px4.sh logs px4
+./scripts/start_ros2_px4.sh logs agent
+./scripts/start_ros2_px4.sh logs px4
 ```
 
 ## 停止
 
 ```bash
-./start_ros2_px4.sh stop
+./scripts/start_ros2_px4.sh stop
 ```
 
 不要直接关闭SSH窗口替代停止流程。脚本会先向PX4/Gazebo发送`Ctrl-C`，再停止Agent。

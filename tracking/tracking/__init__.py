@@ -1,4 +1,4 @@
-"""Truth-first dual-UAV tracking guidance and evaluation."""
+"""真值优先的双机跟踪制导与评估。"""
 
 from tracking.estimation import (
 	NoisyTargetSensor,

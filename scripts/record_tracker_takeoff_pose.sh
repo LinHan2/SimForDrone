@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 
 SIMFORDRONE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-source "${SIMFORDRONE_ROOT}/env/activate_system_ros2_jazzy.sh"
+source "${SIMFORDRONE_ROOT}/scripts/env/activate_system_ros2_jazzy.sh"
 
 cd "${SIMFORDRONE_ROOT}"
 exec /usr/bin/python3 "${SIMFORDRONE_ROOT}/utils/record_tracker_takeoff_pose.py" "$@"
