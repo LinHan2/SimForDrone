@@ -394,6 +394,7 @@ def run_takeoff_hover_land(
 
     samples: list[dict[str, float]] = []
     errors: list[float] = []
+    steady_errors: list[float] = []
     hold_target = (
         link.odom.p[0] + args.offset_north,
         link.odom.p[1] + args.offset_east,
@@ -419,7 +420,10 @@ def run_takeoff_hover_land(
             if fsm.state == State.AUTO_HOVER:
                 if hover_seen_at is None:
                     hover_seen_at = now
-                errors.append(math.dist(link.odom.p, fsm.hover_pose))
+                error = math.dist(link.odom.p, fsm.hover_pose)
+                errors.append(error)
+                if now - hover_seen_at >= 8.0:
+                    steady_errors.append(error)
                 if now - hover_seen_at >= args.hold_seconds:
                     break
             if now - start > 120.0:
@@ -433,6 +437,10 @@ def run_takeoff_hover_land(
         "hold_error_mean_m": (sum(errors) / len(errors)) if errors else None,
         "hold_error_max_m": max(errors) if errors else None,
         "hold_samples": len(errors),
+        "steady_error_mean_m": (sum(steady_errors) / len(steady_errors)) if steady_errors else None,
+        "steady_error_max_m": max(steady_errors) if steady_errors else None,
+        "steady_samples": len(steady_errors),
+        "settle_skip_s": 8.0,
         "samples": samples[:: max(1, len(samples) // 200)],
         **result,
     }
@@ -514,6 +522,8 @@ def main(argv: list[str] | None = None) -> int:
         "profile": args.profile,
         "execute": args.execute,
         "rate_hz": args.rate_hz,
+        "control_mode": "so3_bodyrate" if params.use_bodyrate_ctrl else "quaternion_attitude",
+        "so3_max_bodyrate_rad_s": params.so3.max_bodyrate,
         "connection": params.link.connection or role.sim_connection,
         "expected_system_id": role.system_id,
     }

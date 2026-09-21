@@ -5,10 +5,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import queue
 import select
 import sys
-import threading
 import time
 from pathlib import Path
 
@@ -25,50 +23,6 @@ from tracking.trajectory import WaypointSegment
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = ROOT / "px4ctrl" / "config" / "sim.yaml"
-
-
-def put_latest(messages: queue.Queue[str], message: str) -> None:
-    """非阻塞写入最新诊断；输出端拥塞时丢弃旧诊断而不拖慢控制循环。"""
-
-    try:
-        messages.put_nowait(message)
-        return
-    except queue.Full:
-        pass
-    try:
-        messages.get_nowait()
-    except queue.Empty:
-        pass
-    try:
-        messages.put_nowait(message)
-    except queue.Full:
-        # 消费线程恰好抢先取走旧项时，另一个生产者也可能已填满；诊断可丢，设定点不可等。
-        pass
-
-
-class DeferredDiagnostics:
-    """把慢终端输出移出控制线程的有界诊断通道。"""
-
-    def __init__(self) -> None:
-        self._messages: queue.Queue[str] = queue.Queue(maxsize=1)
-        self._closed = threading.Event()
-        self._thread = threading.Thread(target=self._drain, name="target-diagnostics", daemon=True)
-        self._thread.start()
-
-    def publish(self, message: str) -> None:
-        put_latest(self._messages, message)
-
-    def close(self) -> None:
-        self._closed.set()
-        self._thread.join(timeout=0.1)
-
-    def _drain(self) -> None:
-        while not self._closed.is_set():
-            try:
-                message = self._messages.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            print(message, flush=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -88,10 +42,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dwell", type=float, default=5.0, help="到达每个航点后的停留时间（s）")
     parser.add_argument("--final-hold", type=float, default=15.0, help="末航点完成后继续悬停和发布状态（s）")
     parser.add_argument("--tolerance", type=float, default=0.25, help="航点到达半径（m）")
-    # 航段限值要显著低于倾角饱和对应的水平加速度（约 g·tan(25°) ≈ 4.6 m/s²），
-    # 否则位置环仍会饱和并振荡；0.8/1.0 已在实飞中验证不会引起振荡。
-    parser.add_argument("--max-speed", type=float, default=0.8, help="航段最大速度（m/s）")
-    parser.add_argument("--max-accel", type=float, default=1.0, help="航段最大加速度（m/s²）")
+    parser.add_argument(
+        "--probe-seconds",
+        type=float,
+        default=15.0,
+        help="dry-run 持续发布 target 状态的时间（s）",
+    )
+    # 倾角预算必须覆盖完整控制量 Kp·位置误差 + Kv·速度误差 + 加速度前馈，不能只看
+    # 轨迹的加速度上限。25° 约为 4.6 m/s²；保守的 0.25/0.25 为反馈项留出余量。
+    parser.add_argument("--max-speed", type=float, default=0.25, help="航段最大速度（m/s）")
+    parser.add_argument("--max-accel", type=float, default=0.25, help="航段最大加速度（m/s²）")
     parser.add_argument("--state-host", default=DEFAULT_STATE_HOST)
     parser.add_argument("--state-port", type=int, default=DEFAULT_STATE_PORT)
     parser.add_argument("--output-root", type=Path, default=ROOT / "logs" / "tracking")
@@ -270,8 +230,14 @@ def wait_shared_position(link: MavlinkLink, fsm: PX4CtrlFSM, timeout: float) -> 
 
 def main() -> int:
     args = parse_args()
-    if args.start_delay < 0.0 or args.dwell < 0.0 or args.final_hold < 0.0 or args.tolerance <= 0.0:
-        raise ValueError("start-delay/dwell/final-hold 必须非负，tolerance 必须为正")
+    if (
+        args.start_delay < 0.0
+        or args.dwell < 0.0
+        or args.final_hold < 0.0
+        or args.probe_seconds <= 0.0
+        or args.tolerance <= 0.0
+    ):
+        raise ValueError("start-delay/dwell/final-hold 必须非负，probe-seconds/tolerance 必须为正")
     if args.max_speed <= 0.0 or args.max_accel <= 0.0:
         raise ValueError("max-speed 与 max-accel 必须为正")
     points = args.point or [(0.0, 0.0, 2.0), (2.0, 0.0, 2.0), (0.0, 0.0, 2.0)]
@@ -280,7 +246,6 @@ def main() -> int:
     link = MavlinkLink(params.link, resolve_role("target"), shared_frame=params.shared_frame)
     fsm = PX4CtrlFSM(params, LinearControl(params), link, log=lambda message: print(f"[target] {message}"))
     publisher = TargetStatePublisher(args.state_host, args.state_port)
-    diagnostics = DeferredDiagnostics()
     output_dir = args.output_root / f"target-waypoints-{time.strftime('%Y%m%d-%H%M%S')}"
     record: dict[str, object] = {"task": "target-waypoints", "points": points, "execute": args.execute}
 
@@ -289,8 +254,8 @@ def main() -> int:
         wait_ready(link, fsm, defaults.ready_timeout, print)
         wait_shared_position(link, fsm, defaults.ready_timeout)
         if not args.execute:
-            print("target dry-run：连续发布共享状态 5s，未发送控制命令")
-            deadline = time.monotonic() + 5.0
+            print(f"target dry-run：连续发布共享状态 {args.probe_seconds:.1f}s，未发送控制命令")
+            deadline = time.monotonic() + args.probe_seconds
             while time.monotonic() < deadline:
                 now = time.monotonic()
                 link.pump()
@@ -369,11 +334,12 @@ def main() -> int:
                         local = link.odom.p
                         shared = link.shared_position
                         reference_p_local, _, _ = segment.sample(now - segment_started)
-                        diagnostics.publish(
+                        print(
                             f"[target-state] local=({local[0]:+.2f},{local[1]:+.2f},{local[2]:+.2f}) "
                             f"shared=({shared[0]:+.2f},{shared[1]:+.2f},{shared[2]:+.2f}) "
                             f"ref_local=({reference_p_local[0]:+.2f},{reference_p_local[1]:+.2f},"
-                            f"{reference_p_local[2]:+.2f}) err={error:.3f}m"
+                            f"{reference_p_local[2]:+.2f}) err={error:.3f}m",
+                            flush=True,
                         )
                         next_status = now + 1.0
                     if error <= args.tolerance:
@@ -417,7 +383,6 @@ def main() -> int:
     finally:
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "run.json").write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        diagnostics.close()
         publisher.close()
         link.close()
         print(f"LOG: {output_dir}")

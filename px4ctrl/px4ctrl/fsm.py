@@ -328,7 +328,11 @@ class PX4CtrlFSM:
         output.thrust = max(0.0, min(1.0, output.thrust))
 
         if self.stream_enabled:
-            self.link.send_attitude_thrust(output.q, output.thrust)
+            self.link.send_attitude_thrust(
+                output.q,
+                output.thrust,
+                bodyrates=output.bodyrates if self.params.use_bodyrate_ctrl else None,
+            )
 
         return output
 
@@ -336,7 +340,11 @@ class PX4CtrlFSM:
         """供命令等待期间调用，维持设定点流不中断。"""
 
         if self.stream_enabled:
-            self.link.send_attitude_thrust(self.last_output.q, self.last_output.thrust)
+            self.link.send_attitude_thrust(
+                self.last_output.q,
+                self.last_output.thrust,
+                bodyrates=self.last_output.bodyrates if self.params.use_bodyrate_ctrl else None,
+            )
         self.link.pump()
 
     # -------------------------------------------------------------- 推力模型

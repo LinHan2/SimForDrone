@@ -4,6 +4,8 @@
 mass: 0.8            # kg，按实际机架填写
 gra: 9.81
 ctrl_freq_max: 100.0
+# false：四元数姿态设定点；true：SO(3) 群对数误差生成的 FLU body-rate 设定点。
+# 真机只允许在仿真和单机低高度验收通过后打开；PX4 仍负责角速度/力矩内环。
 use_bodyrate_ctrl: false
 max_angle: 15.0      # 真机首次调试建议保守
 max_manual_vel: 2.5
@@ -54,6 +56,12 @@ gain:
   KAngR: 20.0
   KAngP: 20.0
   KAngY: 20.0
+
+so3:
+  # Omega_cmd = Omega_ff + KAng*Log(R^T R_d) - rate_damping*e_Omega。
+  # 初次真机验收保持 3 rad/s 上限，不要在未取得单机日志前提高。
+  rate_damping: 0.3
+  max_bodyrate: 3.0
 
 msg_timeout:
   odom: 0.5

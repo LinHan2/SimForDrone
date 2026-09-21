@@ -23,13 +23,13 @@ class FakeLink:
     def __init__(self, clock: float = 1000.0) -> None:
         self.odom = OdomData(recv_time=clock, q=quaternion_from_yaw(0.0))
         self.imu = ImuData(recv_time=clock)
-        self.sent: list[tuple[tuple[float, float, float, float], float]] = []
+        self.sent: list[tuple[tuple[float, float, float, float], float, tuple[float, float, float] | None]] = []
 
     def pump(self) -> None:
         """真实链路在这里收报文；测试里没有报文可收。"""
 
-    def send_attitude_thrust(self, q, thrust) -> None:
-        self.sent.append((q, thrust))
+    def send_attitude_thrust(self, q, thrust, *, bodyrates=None) -> None:
+        self.sent.append((q, thrust, bodyrates))
 
 
 class ControlLawTest(unittest.TestCase):
@@ -168,6 +168,65 @@ class ControlLawTest(unittest.TestCase):
         )
         self.assertTrue(self.controller.debug.tilt_saturated)
 
+    def test_so3_bodyrate_uses_exact_large_rotation_error(self) -> None:
+        params = replace(
+            self.params,
+            use_bodyrate_ctrl=True,
+            gain=replace(self.params.gain, kang_r=1.0),
+        )
+        controller = LinearControl(params)
+        angle = 1.2
+        current_q = (math.sin(angle / 2.0), 0.0, 0.0, math.cos(angle / 2.0))
+        odom = OdomData(recv_time=1.0, q=current_q)
+        imu = ImuData(recv_time=1.0, q=current_q)
+
+        output = controller.calculate_control(DesiredState(), odom, imu, now=1.0)
+
+        self.assertAlmostEqual(controller.debug.so3_rotation_error[0], -angle, places=12)
+        self.assertAlmostEqual(output.bodyrates[0], -angle, places=12)
+        self.assertEqual(output.bodyrates[1:], (0.0, 0.0))
+
+    def test_so3_bodyrate_is_limited_before_sending(self) -> None:
+        params = replace(
+            self.params,
+            use_bodyrate_ctrl=True,
+            gain=replace(self.params.gain, kang_r=20.0),
+            so3=replace(self.params.so3, max_bodyrate=1.0),
+        )
+        controller = LinearControl(params)
+        angle = 1.2
+        current_q = (math.sin(angle / 2.0), 0.0, 0.0, math.cos(angle / 2.0))
+
+        output = controller.calculate_control(
+            DesiredState(),
+            OdomData(recv_time=1.0, q=current_q),
+            ImuData(recv_time=1.0, q=current_q),
+            now=1.0,
+        )
+
+        self.assertAlmostEqual(output.bodyrates[0], -1.0, places=12)
+
+    def test_so3_yaw_rate_feedback_damps_measured_rotation(self) -> None:
+        params = replace(
+            self.params,
+            use_bodyrate_ctrl=True,
+            gain=replace(self.params.gain, kang_y=1.0),
+            so3=replace(self.params.so3, rate_damping=1.0, max_bodyrate=10.0),
+        )
+        controller = LinearControl(params)
+        angle = 0.2
+        current_q = quaternion_from_yaw(angle)
+        output = controller.calculate_control(
+            DesiredState(),
+            OdomData(recv_time=1.0, q=current_q),
+            ImuData(recv_time=1.0, q=current_q, w=(0.0, 0.0, -0.4)),
+            now=1.0,
+        )
+
+        # e_R,z=-0.2，e_Omega,z=-0.4；阻尼应令指令为 -0.2-(-0.4)=+0.2 rad/s。
+        self.assertAlmostEqual(controller.debug.so3_rate_error[2], -0.4, places=12)
+        self.assertAlmostEqual(output.bodyrates[2], 0.2, places=12)
+
 
 class CommandFreshnessTest(unittest.TestCase):
     """制导指令的时间戳与超时降级。"""
@@ -246,6 +305,15 @@ class CommandFreshnessTest(unittest.TestCase):
         self.assertEqual(self.fsm.state, State.AUTO_HOVER)
         self.assertEqual(self.fsm.hover_pose, self.link.odom.p)
         self.assertFalse(self.fsm.controller.debug.tilt_saturated)
+
+    def test_so3_mode_sends_bodyrate_setpoints(self) -> None:
+        self.fsm.params = replace(self.params, use_bodyrate_ctrl=True)
+        self.fsm.controller.params = self.fsm.params
+        self.fsm.request_hover(1000.0)
+
+        self._advance(1000.0)
+
+        self.assertIsNotNone(self.link.sent[-1][2])
 
 
 if __name__ == "__main__":

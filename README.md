@@ -34,6 +34,8 @@ SimForDrone/
 所有项目模块变更必须更新 [项目进度](READMELIST/progress.md)；运行命令集中在
 [运行手册](READMELIST/runbook.md)，而“命令到无人机之间的完整调用链、环境画像、
 进程间通信与端口归属”见 [调用关系整理](READMELIST/invocation_map.md)。
+控制律、$SO(3)$ 姿态误差、推力模型和安全边界见
+[控制与推力建模方法](READMELIST/control_method.md)。
 
 `scripts/env/activate_isaacsim_internal_ros.sh` 只能由 Isaac 启动脚本在子进程中加载；
 `scripts/env/activate_system_ros2_jazzy.sh` 只能在验收或算法终端加载。二者不能在同一进程混用。
@@ -62,7 +64,8 @@ cd /data/disk2/home/hl/research/SimForDrone
 
 观测主题与时间戳验证完成后，才添加一个只读取这些主题的真值/几何跟踪基线；随后再以视觉 6D 位姿替换真值，并将其作为带协方差的 EKF 量测。控制闭环不应绕过这些验收步骤。
 
-单机飞行验证与站位保持命令见 [运行手册](READMELIST/runbook.md) 的 px4ctrl 一节。
+单机飞行验证、站位保持与标定命令见
+[测试与诊断脚本](READMELIST/test_scripts.md) 的控制器单机测试一节。
 
 **T3 之前的已知阻塞**：各机 PX4 EKF 的局部原点互相独立，实测同一高度的两机局部 z 相差
 约 1.1 cm，因此双机相对位置不能用两条 `LOCAL_POSITION_NED` 相减，必须改用共享坐标系

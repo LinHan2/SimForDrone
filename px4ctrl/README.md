@@ -36,6 +36,16 @@ link:
   connection: "serial:/dev/ttyACM0:921600"   # 或 udpout:<飞控IP>:14550
 ```
 
+## SO(3) body-rate 模式
+
+默认 `use_bodyrate_ctrl: false` 发送四元数姿态和推力。设置为 `true` 后，控制器以精确
+$Log(R^T R_d)$ 姿态误差和角速度误差构造 FLU body-rate 设定点，再以
+`SET_ATTITUDE_TARGET` 的 body-rate 模式发送给 PX4。PX4 继续负责角速度到力矩/电机的
+内部闭环。
+
+该模式不是直接力矩控制，且目前只经离线回归验证。先完成仿真与单机低高度验收，再考虑
+启用；`so3.max_bodyrate` 默认限制为 `3 rad/s`，不要在获得该验收日志前提高。
+
 ## 用法
 
 ```bash

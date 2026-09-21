@@ -4,6 +4,8 @@
 mass: 1.0            # kg，仅用于记录/在线推力估计；控制律本身使用归一化推力
 gra: 9.81
 ctrl_freq_max: 100.0 # 控制周期上限；实际下发频率由 CLI 的 --rate-hz 决定（必须 >2 Hz）
+# false：发送四元数姿态；true：发送 SO(3) 群误差生成的 FLU body-rate。
+# body-rate 模式尚只经离线测试，必须完成新的单机验收后才能用于飞行。
 use_bodyrate_ctrl: false
 max_angle: 25.0      # 倾角限幅（度）；负值表示不限制
 max_manual_vel: 2.5
@@ -57,6 +59,12 @@ gain:
   KAngR: 20.0
   KAngP: 20.0
   KAngY: 20.0
+
+so3:
+  # body-rate 模式：Omega_cmd = Omega_ff + KAng*Log(R^T R_d) - damping*e_Omega。
+  # PX4 继续负责角速度/力矩内环；该上限限制发给 PX4 的每轴角速度（rad/s）。
+  rate_damping: 0.3
+  max_bodyrate: 3.0
 
 msg_timeout:
   odom: 0.5

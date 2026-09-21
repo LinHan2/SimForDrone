@@ -26,7 +26,7 @@ from collections import deque
 from dataclasses import asdict, dataclass, field
 from typing import Deque, Tuple
 
-from px4ctrl.frames import quat_mul, quat_normalize
+from px4ctrl.frames import quat_conjugate, quat_mul, quat_normalize, quat_rotate
 from px4ctrl.inputs import (
     ImuData,
     OdomData,
@@ -83,6 +83,10 @@ class DebugInfo:
     #: 限幅前是否有任一倾角超出 ``max_angle``。这是 FSM 安全看门狗的唯一输入，
     #: 不能从限幅后的 roll/pitch 是否恰好等于上限反推。
     tilt_saturated: bool = False
+    #: SO(3) 主值旋转误差 ``Log(R^T R_d)``，仅 body-rate 模式启用时更新。
+    so3_rotation_error: Vector3 = (0.0, 0.0, 0.0)
+    #: 机体系角速度误差 ``Omega - R^T R_d Omega_d``。
+    so3_rate_error: Vector3 = (0.0, 0.0, 0.0)
 
 
 @dataclass
@@ -342,6 +346,64 @@ class LinearControl:
 
         return des_a[2] / (self._thr2acc * tilt_scale)
 
+    @staticmethod
+    def _so3_log(q: Quaternion) -> Vector3:
+        """返回单位四元数所表示旋转的主值对数 ``Log(R)``。
+
+        这里直接用 ``2*atan2(||q_v||, q_w)``，不使用小角度近似。四元数先翻到
+        ``q_w >= 0`` 的半球，使结果为 ``[-pi, pi]`` 内的最短旋转向量；恰好 180 度时
+        旋转轴由四元数向量部分决定。
+        """
+
+        x, y, z, w = quat_normalize(q)
+        if w < 0.0:
+            x, y, z, w = -x, -y, -z, -w
+        axis_norm = math.sqrt(x * x + y * y + z * z)
+        if axis_norm <= 1e-12:
+            return (0.0, 0.0, 0.0)
+        angle = 2.0 * math.atan2(axis_norm, max(0.0, w))
+        scale = angle / axis_norm
+        return (x * scale, y * scale, z * scale)
+
+    def _so3_bodyrates(
+        self, q_cmd: Quaternion, des: DesiredState, odom: OdomData, imu: ImuData
+    ) -> Vector3:
+        """以群对数姿态误差生成 FLU 机体系角速度设定点。
+
+        ``q_error = q_current^* q_cmd`` 对应 ``R^T R_d``，其主值对数是从当前姿态转向
+        期望姿态的精确旋转向量。偏航角速度前馈先在期望机体系表达，再运输到当前机体系；
+        ``imu.w`` 是当前机体系角速度。PX4 跟踪输出角速度，继续承担内层力矩控制。
+        """
+
+        current_q = imu.q if imu.recv_time > 0.0 else odom.q
+        q_error = quat_mul(quat_conjugate(current_q), q_cmd)
+        rotation_error = self._so3_log(q_error)
+
+        # yaw_rate 是世界竖直轴的角速度，旋转到期望机体系后才是 Omega_d。
+        omega_d = quat_rotate(quat_conjugate(q_cmd), (0.0, 0.0, des.yaw_rate))
+        omega_feedforward = quat_rotate(q_error, omega_d)
+        omega = imu.w if imu.recv_time > 0.0 else (0.0, 0.0, 0.0)
+        rate_error = tuple(omega[index] - omega_feedforward[index] for index in range(3))
+
+        gains = (self.params.gain.kang_r, self.params.gain.kang_p, self.params.gain.kang_y)
+        damping = self.params.so3.rate_damping
+        limit = self.params.so3.max_bodyrate
+        bodyrates = tuple(
+            max(
+                -limit,
+                min(
+                    limit,
+                    omega_feedforward[index]
+                    + gains[index] * rotation_error[index]
+                    - damping * rate_error[index],
+                ),
+            )
+            for index in range(3)
+        )
+        self.debug.so3_rotation_error = rotation_error
+        self.debug.so3_rate_error = rate_error
+        return bodyrates
+
     def calculate_control(
         self,
         des: DesiredState,
@@ -386,11 +448,14 @@ class LinearControl:
 
         # 步骤 5：姿态补偿，要求 q_imu 与 q_odom 均已收到；否则退化为直接使用期望姿态。
         if imu.recv_time > 0.0 and odom.recv_time > 0.0:
-            from px4ctrl.frames import quat_conjugate
-
             out.q = quat_normalize(quat_mul(quat_mul(imu.q, quat_conjugate(odom.q)), q_des))
         else:
             out.q = q_des
+
+        if self.params.use_bodyrate_ctrl:
+            out.bodyrates = self._so3_bodyrates(out.q, des, odom, imu)
+        else:
+            out.bodyrates = (0.0, 0.0, 0.0)
 
         self.debug.des_a = des_a
         self.debug.des_v = des.v

@@ -10,13 +10,100 @@
 | **px4ctrl 控制环** | **已落地并验证** | 唯一命令执行模块 `px4ctrl/`；姿态+推力闭环：最高 `1.974 m`、稳态误差均值 `0.023 m`、落地并上锁。证据 `logs/px4ctrl/hold-target-20260918-214430/`。 |
 | P2.1-T2：tracker 站位保持 | **已通过** | 稳态误差均值 `0.014 m`、最大 `0.020 m`（门槛 0.5 m）。证据 `logs/px4ctrl/hold-tracker-20260918-214228/`。 |
 | P2.2：多机共享坐标系 | **已实现并实测验证** | `GLOBAL_POSITION_INT` + 共用地理原点换算；与 ROS 真值同时刻对比偏差约 2 cm。 |
-| P2.3-T3：真值双机跟踪 | 进行中 | 静止 target 加噪闭环已通过；已拆为“target 航点”与“tracker 跟踪”两个独立进程，含手动航点模式与 Isaac 车辆监视窗；44 项单测、双进程 dry-run 通过。**控制律已修复（倾角精确反解 + 垂向推力补偿 + 指令超时），待重飞验证**。 |
+| P2.3-T3：真值双机跟踪 | 进行中 | 静止 target 加噪闭环、target/tracker 双进程 dry-run、target 单机 2 m 往返均已通过；已拆为“target 航点”与“tracker 跟踪”两个独立进程，含手动航点模式与 Isaac 车辆监视窗。下一步是两机同飞复测。 |
 | P3：视觉位姿/EKF | 未开始 | 前置为量化图像与位姿的时间偏差。 |
 
 `vision/` 已建立为独立模块，但按阶段约束暂不接入控制；T3/T4 通过后再以视觉相对位姿替换
 真值输入，所有飞控命令仍统一经过 `px4ctrl/`。
 
+## 当前检查点
+
+- **已验证**：场景启动、target/tracker 双进程 dry-run、target 单机 2 m 往返、自动降落与
+  上锁；完整 `tracking/tests` 离线回归为 67 项通过。
+- **已知保护性失败**：较快的 `v<=0.8 m/s, a<=1.0 m/s²` target 航段在起步后持续倾角饱和；
+  看门狗转入悬停，人工中断后安全落地。这不是通过项，也没有进入双机阶段。
+- **当前默认边界**：固定航点使用 `v<=0.25 m/s, a<=0.25 m/s²`；只有显式传入命令行参数时
+  才覆盖。末航点保持前切入 `AUTO_HOVER`，不再依赖 CMD 超时保护收尾。
+- **暂停点**：动态真值双机跟踪尚未重新验收；在恢复前先保留本检查点，复飞后必须检查两机
+  ULog 的倾角、姿态翻转、冲击和 EKF 偏置指标。
+- **SO(3) 控制模式**：首次仿真单机悬停出现持续 yaw 震荡，不能作为通过验收。根因是
+  `HIGHRES_IMU` 未将机体系角速度写入 `imu.w`，使角速度阻尼项无效；已修复并新增回归，
+  待以低增益临时配置重新进行单机验收。默认配置仍关闭该模式，尚未进行真机验收。
+
 ## 最近记录
+
+### SO(3) body-rate 外环（2026-09-21）
+
+- 新增 `use_bodyrate_ctrl` 可选模式：由精确群对数 $Log(R^T R_d)$ 和角速度误差生成 FLU
+  body-rate，再经 `SET_ATTITUDE_TARGET` 的 body-rate 掩码交给 PX4；默认仍发送四元数姿态。
+- 该模式避免把大角度误差以 $sin(theta)$ 近似，输出以 `so3.max_bodyrate=3 rad/s` 限制。
+  PX4 继续承担角速度到力矩/电机的内部闭环，因此它不是直接力矩型 SO(3) 控制器。
+- 初始实现阶段新增大角度群对数、发送路径和速率限幅回归测试；首次启动场景前，完整离线
+  套件为 66 项通过。随后单机仿真结果见下一节。
+
+### SO(3) 单机悬停故障修复（2026-09-21）
+
+- 首次仿真单机 `takeoff-hover-land` 使用 `KAngY=20`、`rate_damping=0.3` 和
+  `max_bodyrate=3 rad/s`；出现持续 yaw 震荡，未作为验收通过项。控制日志为
+  `logs/px4ctrl/takeoff-hover-land-target-20260921-225420/run.json`。
+- 根因：`link.py` 的 `HIGHRES_IMU` 映射只更新加速度、未更新 `imu.w`，故
+  $e_\Omega=\Omega-\Omega_d$ 错误地近似为零，SO(3) 的速率阻尼没有收到实测角速度。
+  现已按 FRD $\rightarrow$ FLU 映射写入 $(p,-q,-r)$。
+- 临时复测配置 `/tmp/sim-so3.yaml` 限制为 `KAngR/P=6`、`KAngY=1.5`、
+  `rate_damping=1.0`、`max_bodyrate=1.0 rad/s`；它不改动仓库基线。新增 yaw 阻尼与
+  角速度坐标变换测试，完整离线套件现为 67 项通过。仍须进行低空单机重测。
+
+### 场景重启与 dry-run 时序修复（2026-09-20）
+
+- `scripts/start_dual_px4_scene.sh` 迁移后首次真实启动通过：Isaac Sim 5.1、WebRTC、内置
+  Jazzy rclpy、Pegasus 和两套 PX4 SITL 均启动；两机均打印 `Ready for takeoff!`。启动中的
+  GLFW/X display、GPU P2P/IOMMU 与相机 aperture 警告均为已知非致命初始化提示。
+- 首次按“先 target、再 tracker”执行 dry-run 暴露一个时序缺陷：target 只发布 5 秒状态，而
+  tracker 进程完成 MAVLink 就绪时该窗口已结束。target 自身链路已通过，故问题不在 MAVLink、
+  共享 ENU 或 UDP 编解码。
+- 修复：`target_waypoints.py` 新增 `--probe-seconds`（默认 15 秒）控制 dry-run 的发布窗口；
+  非正值在起飞前拒绝。新增参数解析回归测试，后续按同一推荐顺序重做双进程 dry-run。
+
+### target 单机航点复测（2026-09-20）
+
+- 修复后的 target/tracker 双进程 dry-run 通过：tracker 在 target 的 15 秒发布窗口内收到新鲜
+  共享 ENU 状态，不再受启动时序影响。
+- 首次单机 2 m 航段使用 `v<=0.8 m/s, a<=1.0 m/s²` 时，控制器在起步后持续倾角饱和
+  `0.523 s`，看门狗立即切换当前点悬停；人工中断后 `LAND` 被接受，最终
+  `on_ground=True, disarmed=True`，没有姿态翻转。
+- 根因是轨迹限值只约束加速度前馈，未给 `Kp·位置误差 + Kv·速度误差` 留出 25 度倾角预算。
+  默认限值已收紧为 `v<=0.25 m/s, a<=0.25 m/s²`，保留显式命令行覆盖能力。
+- 保守限值复飞通过：两段 2 m 往返均收敛，最终误差约 `0.013 m` 与 `0.016 m`，无倾角饱和；
+  正常 `LAND` 并确认 `on_ground=True, disarmed=True`。证据
+  `logs/tracking/target-waypoints-20260920-154346/`。
+- 任务末尾原本会停止刷新 `CMD_CTRL` 指令并触发一次无害的命令超时告警；现已在最终保持前
+  显式切换 `AUTO_HOVER`。完整离线回归为 63 项通过。
+
+### 删除已被取代的 shell 包装（2026-09-19）
+
+按“能力已被主路径完全覆盖 + 近期无使用痕迹”筛掉 3 个脚本，项目 shell 由 14 个减到 11 个：
+
+| 已删除 | 取代它的路径 | 删除依据 |
+|---|---|---|
+| `scripts/start_ros2_px4.sh` | Isaac + Pegasus + PX4 SITL | 独立的 Gazebo/ROS2 栈，`logs/ros2_px4/` 最后活动停在 9月7 |
+| `scripts/run_tracking.sh` | `scripts/run_target_waypoints.sh` + `scripts/run_tracker.sh` | 单进程旧形态（同时占用 14540/14541），文档自述已被取代 |
+| `scripts/record_tracker_takeoff_pose.sh` | `scripts/run_px4ctrl.sh` 的 `hold`/`measure-hover` | P2.0 起降验收已完成，核验统一由 px4ctrl 负责 |
+
+**保留原则：只删 shell 包装，不删底层能力。** `tracking/tracking/run_static.py`、
+`utils/record_tracker_takeoff_pose.py` 都仍在，文档给出直接调用方式；只读诊断类
+（`check_*`、`capture_*`、`show_latest_tracking_result.sh`）因仍服务后续视觉阶段而保留。
+
+恢复任一被删脚本（内容都在 git 中，已验证可读出）：
+
+```bash
+git show HEAD:scripts/run_tracking.sh > scripts/run_tracking.sh
+git show HEAD:start_ros2_px4.sh > scripts/start_ros2_px4.sh
+git show :scripts/record_tracker_takeoff_pose.sh > scripts/record_tracker_takeoff_pose.sh
+```
+
+同步更新的文档：`tracking/README.md`、`READMELIST/invocation_map.md`、
+`READMELIST/runbook.md`；`READMELIST/ros2_px4_startup_test.md` 加了顶部归档说明
+（保留 uXRCE-DDS / `/fmu` 配置知识，并注明恢复命令）。
 
 ### shell 启动脚本集中到 `scripts/`（2026-09-19）
 
@@ -154,7 +241,8 @@
 
 注意 `est_a` 的坐标系要求：必须是**机体 FLU 系的比力 z 分量**（`link.imu.acc[2]`，悬停
 约 `+g`），不能用世界系垂向加速度。代码里保留了计数器，状态机在持续为负时打印
-`WARN: 机体 z 轴比力持续为负`。完整标定步骤见 [运行手册](runbook.md)。
+`WARN: 机体 z 轴比力持续为负`。完整标定步骤见
+[测试与诊断脚本](test_scripts.md)。
 
 ### 飞行日志取证：振限循环 → 翻转 → EKF 崩坏（2026-09-19）
 

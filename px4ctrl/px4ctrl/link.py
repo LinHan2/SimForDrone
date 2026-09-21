@@ -274,6 +274,11 @@ class MavlinkLink:
                     -float(message.yacc),
                     -float(message.zacc),
                 )
+                self.imu.w = (
+                    float(message.xgyro),
+                    -float(message.ygyro),
+                    -float(message.zgyro),
+                )
                 self.imu.recv_time = now
             elif kind == "SYS_STATUS":
                 self.battery = BatteryData(

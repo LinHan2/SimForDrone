@@ -1,5 +1,10 @@
 # ROS 2 与 PX4 启动、测试流程
 
+> **已于 2026-09-19 归档**：本路径的启动脚本 `scripts/start_ros2_px4.sh` 已删除。项目当前使用
+> Isaac Sim + Pegasus + PX4 SITL，不再走 Gazebo 这条栈；本文保留 uXRCE-DDS、`/fmu` 话题等
+> 配置知识。需要恢复脚本：`git show HEAD:start_ros2_px4.sh > scripts/start_ros2_px4.sh`。
+> 下文命令中的 `./scripts/start_ros2_px4.sh` 均指该已删除脚本。
+
 统一入口：
 
 ```bash

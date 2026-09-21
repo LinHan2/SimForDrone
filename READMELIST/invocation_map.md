@@ -68,7 +68,7 @@ graph TD
     subgraph ALGO["算法层"]
         T1["tracking.run_tracker（终端 2）"]
         T2["tracking.target_waypoints（终端 1）"]
-        T3["tracking.run_static（单进程，旧）"]
+        T3["tracking.run_static（单进程，旧；shell 包装已删）"]
         T4["tracking.guidance"]
         T5["tracking.trajectory"]
         T6["tracking.estimation"]
@@ -160,16 +160,19 @@ graph TD
 ### 3.2 单进程双机（早期形态，`run_static.py`）
 
 一个进程内同时开两个 `MavlinkLink`（14540 + 14541）控制两台机，只能跑固定脚本，
-无法手动输入航点，也不经过 UDP 状态转发（真值在进程内直接共享）：
+无法手动输入航点，也不经过 UDP 状态转发（真值在进程内直接共享）。**shell 包装
+`scripts/run_tracking.sh` 已删除**，模块保留，需要时直接调用：
 
 ```bash
-./scripts/run_tracking.sh --execute          # → tracking.run_static
+export SIMFORDRONE_ROOT=/data/disk2/home/hl/research/SimForDrone
+source scripts/env/activate_px4_mavlink_control.sh
+PYTHONPATH=tracking:px4ctrl "${SIMFORDRONE_PX4_PYTHON}" -m tracking.run_static --execute
 ```
 
 它对起飞与降落有自己的双机实现（`enter_offboard_both` / `land_both`），
 只从 `px4ctrl.cli` 借用 `wait_ready`。
 
-> 已被 3.1 取代。保留它是因为它是最小的端到端回归用例，排查“是不是多进程引入的问题”时很有用。
+> 已被 3.1 取代；模块保留为最小的端到端回归用例，排查“是不是多进程引入的问题”时可用。
 
 ### 3.3 只读验收（不发任何控制指令）
 
@@ -177,9 +180,11 @@ graph TD
 ./scripts/check_dual_uav_observation.sh   # source 系统 ROS，检查话题是否齐全
 ./scripts/capture_rgbd_sample.sh          # 采一组 RGB-D 到 logs/rgbd_samples/
 ./scripts/check_observer_rgb_scene.sh     # 检查画面可读性
-./scripts/record_tracker_takeoff_pose.sh  # 独立核验起飞高度
 ./scripts/show_latest_tracking_result.sh  # 汇总 logs/tracking/ 最新结果
 ```
+
+（原 `record_tracker_takeoff_pose.sh` 已删除：P2.0 起降核验统一由 px4ctrl 负责；ROS-only
+记录器仍可用 `/usr/bin/python3 utils/record_tracker_takeoff_pose.py` 直接调用。）
 
 这些脚本统一 `source scripts/env/activate_system_ros2_jazzy.sh` 并用 `/usr/bin/python3`，
 **与两个控制进程完全隔离**，因此可以随时运行，不影响飞行。

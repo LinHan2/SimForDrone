@@ -95,6 +95,24 @@ class GainParams:
 
 
 @dataclass(frozen=True)
+class SO3Params:
+    """SO(3) 体轴角速度外环参数。
+
+    ``use_bodyrate_ctrl`` 打开时，``KAng*`` 是姿态群误差到期望角速度的增益；本段给出
+    对角速度误差的阻尼和发送给 PX4 前的安全上限。PX4 仍负责内层角速度/力矩控制。
+    """
+
+    rate_damping: float = 0.3
+    max_bodyrate: float = 3.0
+
+    def __post_init__(self) -> None:
+        if self.rate_damping < 0.0:
+            raise ParamError("so3.rate_damping 必须非负")
+        if self.max_bodyrate <= 0.0:
+            raise ParamError("so3.max_bodyrate 必须为正数")
+
+
+@dataclass(frozen=True)
 class TimeoutParams:
     """``msg_timeout`` 段：各输入的新鲜度门限（秒）。
 
@@ -181,6 +199,7 @@ class Params:
     takeoff_land: TakeoffLandParams
     thrust_model: ThrustModelParams
     gain: GainParams
+    so3: SO3Params
     timeouts: TimeoutParams
     link: LinkParams
     tasks: TaskDefaults
@@ -224,6 +243,7 @@ def load_params(path: str | Path) -> Params:
     tl = dict(raw.get("auto_takeoff_land") or {})
     tm = dict(raw.get("thrust_model") or {})
     gain = dict(raw.get("gain") or {})
+    so3 = dict(raw.get("so3") or {})
     tmo = dict(raw.get("msg_timeout") or {})
     task = dict(raw.get("tasks") or {})
     shared = dict(raw.get("shared_frame") or {})
@@ -271,6 +291,10 @@ def load_params(path: str | Path) -> Params:
             kang_r=float(gain.get("KAngR", 20.0)),
             kang_p=float(gain.get("KAngP", 20.0)),
             kang_y=float(gain.get("KAngY", 20.0)),
+        ),
+        so3=SO3Params(
+            rate_damping=float(so3.get("rate_damping", 0.3)),
+            max_bodyrate=float(so3.get("max_bodyrate", 3.0)),
         ),
         timeouts=TimeoutParams(
             odom=float(tmo.get("odom", 0.5)),

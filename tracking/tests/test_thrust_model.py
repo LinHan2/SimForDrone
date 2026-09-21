@@ -170,7 +170,7 @@ class FakeLink:
     def pump(self) -> None:
         """测试里没有报文可收。"""
 
-    def send_attitude_thrust(self, q, thrust) -> None:
+    def send_attitude_thrust(self, q, thrust, *, bodyrates=None) -> None:
         self.sent.append((q, thrust))
 
 
