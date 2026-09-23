@@ -1,8 +1,0 @@
-CMake Error: The current CMakeCache.txt directory /data/disk2/home/hl/research/SimForDrone/PX4-Autopilot/build/px4_sitl_default/CMakeCache.txt is different than the directory /data/disk2/home/hl/research/PX4-Autopilot/build/px4_sitl_default where CMakeCache.txt was created. This may result in binaries being created in the wrong place. If you are not sure, reedit the CMakeCache.txt
-[0/1] Re-running CMake...
-CMake Error: The source directory "/data/disk2/home/hl/research/PX4-Autopilot" does not exist.
-Specify --help for usage, or press the help button on the CMake GUI.
-FAILED: build.ninja 
-/usr/bin/cmake --regenerate-during-build -S/data/disk2/home/hl/research/PX4-Autopilot -B/data/disk2/home/hl/research/PX4-Autopilot/build/px4_sitl_default
-ninja: error: rebuilding 'build.ninja': subcommand failed
-make: *** [Makefile:250: px4_sitl] Error 1

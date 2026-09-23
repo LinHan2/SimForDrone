@@ -64,7 +64,7 @@ $$
 $$
 
 $$
- 	heta=\operatorname{atan2}\left(a_x\cos(\psi)+a_y\sin(\psi),a_z\right).
+θ=\operatorname{atan2}\left(a_x\cos(\psi)+a_y\sin(\psi),a_z\right).
 $$
 
 因此，横滚与俯仰并非小角度近似。使用实测偏航而非期望偏航的原因是横向加速度方向必须对应当前可实现的机体系方向；当前任务保持固定偏航，故该选择不会引入显著偏航过渡误差。
@@ -162,27 +162,204 @@ e_R=\operatorname{Log}(R_e),
 e_{\Omega} = \Omega - R^T R_d \Omega_d.
 $$
 
-其中 $\operatorname{Log}:SO(3)\rightarrow\mathbb{R}^3$ 是主值旋转群对数：若误差旋转的轴角表示为 $(n,\theta)$，则 $\operatorname{Log}(R_e)=\theta n$，取 $\theta\in[-\pi,\pi]$。实现直接由单位误差四元数 $q_e=(v,w)$ 计算：
+其中 $\Omega$ 是当前 FLU 机体系角速度，$\Omega_d$ 是期望机体系角速度，二者都以
+各自的机体系表达。$R_e\Omega_d$ 将期望角速度运输到当前机体系，故
+$e_\Omega$ 可直接相减。$\operatorname{Log}:SO(3)\rightarrow\mathbb{R}^3$ 是主值
+旋转群对数：若误差旋转的轴角表示为 $(n,\theta)$，则
+$\operatorname{Log}(R_e)=\theta n$，其中 $\theta\in[0,\pi]$。在 $\theta=\pi$ 时
+旋转轴的符号不唯一，因此主值对数在该集合上不连续；这正是本方法不能宣称全局渐近稳定的
+拓扑原因。
+
+实现先计算 $q_e=q^*\otimes q_d$，它对应 $R_e=R^T R_d$。令单位四元数
+$q_e=(v,w)$，再翻转到 $w\geq0$ 的半球，得到：
 
 $$
 e_R=\frac{2\operatorname{atan2}(\lVert v\rVert,w)}{\lVert v\rVert}v.
 $$
 
-这不是小角度近似。与 $\frac12(R_d^TR-R^TR_d)^\vee=\sin(\theta)n$ 相比，群对数在大角度时不会将误差从 $\theta$ 压缩为 $\sin(\theta)$。$e_{\Omega}$ 表示当前机体系角速度与运输到当前机体系后的期望角速度之差。
-
-设世界系期望偏航速率为 $\dot{\psi}_d$，则先得到期望机体系角速度 $\Omega_d$，再运输到当前机体系：
+当 $\lVert v\rVert\rightarrow0$ 时，代码返回零向量以避免数值除零。这不是小角度近似。
+与常见的
 
 $$
+\frac12(R_d^TR-R^TR_d)^\vee=\sin(\theta)n
+$$
+
+相比，群对数在大角度时不会将误差从 $\theta$ 压缩为 $\sin(\theta)$；例如
+$\theta=150^\circ$ 时，前者的误差模长是 $2.618$ rad，后者仅为 $0.5$。这使得外环在
+大初始误差下仍保持与实际最短旋转角一致的反馈量，但不消除 $180^\circ$ 处的拓扑边界。
+
+### 参考角速度的构造
+
+当前制导器只显式给出世界竖直轴偏航速率 $\dot\psi_d$，所以代码先写出世界系角速度：
+
+$$
+\omega_d^W=e_3\dot\psi_d.
+$$
+
+它随后转换到期望机体系，并运输到当前机体系：
+
+$$
+\Omega_d=R_d^T\omega_d^W,
+\qquad
 \Omega_{ff}=R_e\Omega_d.
 $$
 
-发送给 PX4 的 FLU 机体系角速度为：
+对应实现中的 `quat_rotate(conjugate(q_cmd), (0, 0, yaw_rate))` 与
+`quat_rotate(q_error, omega_d)`。当 $\dot\psi_d=0$ 时，$\Omega_{ff}=0$；横滚、俯仰
+参考由位置外环产生的 $R_d$ 给出，当前代码没有计算它们的解析角速度前馈。因此快速变化的
+横向轨迹会表现为外环必须消除的时变姿态误差，而不是被完整前馈抵消。
+
+### 控制率、参数与发送路径
+
+当前控制率为：
 
 $$
-\Omega_{cmd}=\operatorname{sat}_{\omega_{\max}}\left(\Omega_{ff}+K_R e_R-k_{\Omega}e_{\Omega}\right).
+\Omega_{\mathrm{cmd}}=
+\operatorname{sat}_{\omega_{\max}}
+\left(
+\Omega_{ff}+K_R e_R-k_\Omega e_\Omega
+\right),
 $$
 
-其中 $K_R=\operatorname{diag}(KAngR,KAngP,KAngY)$，$k_{\Omega}$ 是 `so3.rate_damping`，$\omega_{\max}$ 是 `so3.max_bodyrate`。当前仿真和真机配置均采用 $\omega_{\max}=3\,\mathrm{rad/s}$，这是发送前的安全限幅，不是小角度假设。
+其中
+
+$$
+K_R=\operatorname{diag}(k_\phi,k_\theta,k_\psi)
+=\operatorname{diag}(\texttt{KAngR},\texttt{KAngP},\texttt{KAngY}),
+\qquad
+k_\Omega=\texttt{so3.rate\_damping}.
+$$
+
+`sat` 为逐轴硬限幅，$|\Omega_{\mathrm{cmd},i}|\leq\omega_{\max}$，其中
+$\omega_{\max}=\texttt{so3.max\_bodyrate}$，单位为 rad/s。该实现见
+[controller.py](../px4ctrl/px4ctrl/controller.py) 的 `_so3_bodyrates()`；角速度来自
+`HIGHRES_IMU` 并已由 FRD 转为 FLU。链路层最终将 FLU 设定点映射为 PX4 所需的 FRD
+body-rate，并通过 `SET_ATTITUDE_TARGET` 的 body-rate 掩码发送。
+
+`KAngR/P/Y` 的量纲为 $\mathrm{s^{-1}}$：在未饱和且内环足够快时，它们给出姿态误差
+消失的近似外环带宽。`rate_damping` 是无量纲速率误差反馈系数；`max_bodyrate` 是安全与
+带宽边界，而不是性能增益。`Kp*`、`Kv*` 属于平动外环，只通过 $a_c\rightarrow R_d$
+间接影响姿态需求，并不在上述姿态误差反馈项中。
+
+### 误差运动学
+
+刚体姿态满足 $\dot R=R\hat\Omega$、$\dot R_d=R_d\hat\Omega_d$，其中
+$\hat x y=x\times y$。因此相对姿态满足：
+
+$$
+\begin{aligned}
+\dot R_e
+&=-\hat\Omega R_e+R_e\hat\Omega_d\\
+&=-\widehat{\left(\Omega-R_e\Omega_d\right)}R_e\\
+&=-\hat e_\Omega R_e.
+\end{aligned}
+$$
+
+设 $\xi=\operatorname{Log}(R_e)=e_R$。在主值邻域
+$\mathcal D=\{R_e\mid \|\xi\|<\pi\}$ 内，$SO(3)$ 左雅可比为：
+
+$$
+J_l(\xi)=I+
+\frac{1-\cos\theta}{\theta^2}\hat\xi+
+\frac{\theta-\sin\theta}{\theta^3}\hat\xi^2,
+\qquad \theta=\|\xi\|,
+$$
+
+并由连续延拓取 $J_l(0)=I$。由
+$\dot R_eR_e^T=\widehat{J_l(\xi)\dot\xi}$，得到精确的局部误差方程：
+
+$$
+\dot\xi=-J_l^{-1}(\xi)e_\Omega.
+$$
+
+这一步说明群对数并不是简单把欧拉角误差代入 PD：非交换旋转的曲率由
+$J_l^{-1}(\xi)$ 精确表达。小误差时 $J_l^{-1}(\xi)=I+O(\|\xi\|)$，故其一阶近似才是
+$\dot\xi\approx-e_\Omega$。
+
+### 收敛性分析与适用范围
+
+以下结论分析的是代码的**外层 body-rate 指令器**，不替代 PX4 对角速度、力矩和电机的
+稳定性证明。令参考姿态与参考角速度连续、IMU 无延迟且坐标变换正确，并要求：
+
+1. $\|\xi(0)\|<\pi$，轨迹始终留在主值对数连续域 $\mathcal D$ 内；
+2. body-rate 指令未被 `max_bodyrate` 限幅；
+3. PX4 角速度内环在工作带宽内稳定，并能足够准确地跟踪 $\Omega_{\mathrm{cmd}}$。
+
+在理想速率接口 $\Omega=\Omega_{\mathrm{cmd}}$ 下，代入控制率可得：
+
+$$
+(1+k_\Omega)e_\Omega=K_R\xi,
+$$
+
+$$
+\dot\xi=-J_l^{-1}(\xi)(1+k_\Omega)^{-1}K_R\xi.
+$$
+
+因为 $K_R\succ0$ 且 $1+k_\Omega>0$，在 $\xi=0$ 处线性化为：
+
+$$
+\dot\xi=-(1+k_\Omega)^{-1}K_R\xi+O(\|\xi\|^2).
+$$
+
+其线性部分为 Hurwitz 矩阵，故平衡点 $R=R_d$ 在该域内**局部指数稳定**。特别地，若三轴
+取同一增益 $K_R=k_RI$，则 $J_l(\xi)\xi=\xi$，误差严格满足：
+
+$$
+\dot\xi=-\frac{k_R}{1+k_\Omega}\xi,
+\qquad
+\xi(t)=\exp\left(-\frac{k_R}{1+k_\Omega}t\right)\xi(0).
+$$
+
+对当前三个不同的轴向增益，$J_l^{-1}$ 与 $K_R$ 一般不交换，不能把上式错误地写成全域
+逐轴独立指数解；但连续性和上述 Hurwitz 线性化仍给出原点附近的局部指数收敛。
+
+为说明 `rate_damping` 的物理作用，可将闭合的 PX4 速率链路在固定参考附近近似为每轴一阶
+模型，其中 $T_i>0$ 是第 $i$ 轴的等效时间常数：
+
+$$
+T_i\dot\Omega_i=-\Omega_i+\Omega_{\mathrm{cmd},i},
+\qquad T_i>0.
+$$
+
+在小误差、常值参考且未饱和时，$\dot\xi_i\approx-\Omega_i$，从而：
+
+$$
+T_i\ddot\xi_i+(1+k_\Omega)\dot\xi_i+k_{R,i}\xi_i=0.
+$$
+
+其特征多项式 $T_i s^2+(1+k_\Omega)s+k_{R,i}$ 在
+$T_i>0$、$k_{R,i}>0$、$k_\Omega>-1$ 时 Hurwitz；项目配置进一步约束
+$k_\Omega\geq0$。等效自然频率和阻尼比分别近似为：
+
+$$
+\omega_{n,i}\approx\sqrt{\frac{k_{R,i}}{T_i}},
+\qquad
+\zeta_i\approx\frac{1+k_\Omega}{2\sqrt{T_i k_{R,i}}}.
+$$
+
+所以在该低阶模型中，增大 `KAng*` 会提高带宽但降低相对阻尼，增大 `rate_damping` 会提高
+阻尼。反之，在理想的零滞后速率接口假设下，`rate_damping` 仅使等效比例增益缩小为
+$K_R/(1+k_\Omega)$；这解释了为何它的真正价值依赖实际 PX4 速率动态，不能孤立地从
+理想外环公式判断。
+
+实际系统还存在采样、MAVLink、PX4 与执行器延迟。项目 ULog 已观测到约 $150\,\mathrm{ms}$
+的 yaw-rate 响应延迟，因此高 `KAngY` 会侵蚀相位裕度并可诱发震荡，即使上述无延迟局部模型
+稳定。当前低带宽仿真 profile 将 `KAngR/P=2`、`KAngY=0.3`、
+`rate_damping=0.15`、`max_bodyrate=0.5 rad/s`；它是待单机阶跃验收的保守起点，不是由上式
+直接计算出的真机通用最优值。
+
+下列情况均使上述收敛结论不再适用，必须依赖安全状态机和实验验证，而不能外推理论结果：
+
+- 旋转误差达到或穿过 $\pi$，主值对数不连续，且 $SO(3)$ 上不存在连续时不变反馈的全局
+  渐近稳定实现；
+- `max_bodyrate`、倾角或推力发生饱和，控制率变为分段非线性系统；
+- IMU 角速度丢失、延迟显著、FRD/FLU 映射错误，或姿态估计失效；
+- 快速平动参考使 $R_d$ 的横滚/俯仰变化率不可忽略，而当前实现只前馈偏航角速度；
+- PX4 内环自身未稳定、带宽不足，或其时延相对于外环带宽不可忽略。
+
+因此实际整定必须先保持较低的 `max_bodyrate`，用单机、小幅、单轴阶跃记录实际
+body-rate 与姿态响应；在无饱和、无震荡后才逐步提高 `KAng*`。不能仅凭上述局部稳定条件
+$KAng*>0$ 就直接提高外环增益或进入双机飞行。
 
 ## 与直接力矩 SO(3) 控制的区别
 

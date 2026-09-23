@@ -111,6 +111,18 @@ class LinkError(RuntimeError):
     """连接、身份校验或命令仲裁失败时抛出，保证调用者得到非零退出码。"""
 
 
+class CommandRejectedError(LinkError):
+    """PX4 对命令返回非接受 ACK 时抛出，并保留 ACK 供调用方决定是否重试。"""
+
+    def __init__(self, name: str, ack: dict[str, Any], statustext: str = "") -> None:
+        self.command = int(ack["command"])
+        self.result = int(ack["result"])
+        self.ack = ack
+        self.statustext = statustext.strip()
+        detail = f"；PX4: {self.statustext}" if self.statustext else ""
+        super().__init__(f"{name} 被 PX4 拒绝: {ack}{detail}")
+
+
 class MavlinkLink:
     """单个载具的 MAVLink 连接与包装命令。"""
 
@@ -352,7 +364,7 @@ class MavlinkLink:
                 if ack["result"] == in_progress:
                     self._log(f"{name} 处理中（progress={ack['progress']}）")
                 elif ack["result"] != mavutil.mavlink.MAV_RESULT_ACCEPTED:
-                    raise LinkError(f"{name} 被 PX4 拒绝: {ack}")
+                    raise CommandRejectedError(name, ack, self.last_statustext)
                 else:
                     return ack
             time.sleep(0.005)
@@ -362,14 +374,14 @@ class MavlinkLink:
         self.send_command(command, *params)
         return self.await_ack(command, name, tick=tick)
 
-    def arm(self, *, tick=None) -> dict[str, Any]:
-        """解锁。"""
+    def arm(self, *, force: bool = False, tick=None) -> dict[str, Any]:
+        """解锁；``force=True`` 时跳过 PX4 的 preflight 检查，仅限仿真配置使用。"""
 
         return self.command_and_wait(
             mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
             "arm_command",
             1.0,
-            0.0,
+            21196.0 if force else 0.0,
             0.0,
             0.0,
             0.0,

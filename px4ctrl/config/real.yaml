@@ -78,6 +78,7 @@ link:
   target_system: 1
   target_component: 1
   heartbeat_timeout: 15.0
+  force_arm: false
 
 # 多机共享位置坐标系。
 # 真机上请填入**所有载具共用**的基准点：实测好的 home 坐标，或 RTK 基准站位置。

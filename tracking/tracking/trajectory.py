@@ -22,12 +22,14 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 Vector3 = tuple[float, float, float]
 
 #: 五次多项式 s(τ) 的峰值系数，用于由速度/加速度上限反推段时长。
 _PEAK_FIRST_DERIVATIVE = 1.875
 _PEAK_SECOND_DERIVATIVE = 5.7735
+_TWO_PI = 2.0 * math.pi
 
 
 def _s(tau: float) -> float:
@@ -113,3 +115,129 @@ class WaypointSegment:
         """是否已到段末（用于决定何时切换到下一航点）。"""
 
         return elapsed >= self.duration
+
+
+def trajectory_duration(
+    pattern: str,
+    radius: float,
+    vertical_amplitude: float,
+    max_speed: float,
+    max_accel: float,
+) -> float:
+    """返回一个闭合轨迹周期满足运动学上限所需的最短时长。
+
+    圆形、八字与螺旋都以五次时间缩放推进相位，因此每个周期的起点和终点
+    位置、速度、加速度均为零。下面使用每种空间曲线的一阶和二阶导数模长上界，
+    对时间缩放后的实际速度/加速度给出保守上限，而非只限制相位平均速率。
+    """
+
+    if pattern not in {"circle", "figure8", "helix"}:
+        raise ValueError(f"不支持的轨迹类型: {pattern}")
+    if radius <= 0.0 or vertical_amplitude < 0.0:
+        raise ValueError("radius 必须为正，vertical_amplitude 不得为负")
+    if max_speed <= 0.0 or max_accel <= 0.0:
+        raise ValueError("max_speed 与 max_accel 必须为正")
+
+    if pattern == "circle":
+        first_derivative_bound = radius
+        second_derivative_bound = radius
+    elif pattern == "figure8":
+        first_derivative_bound = math.sqrt(2.0) * radius
+        second_derivative_bound = math.sqrt(5.0) * radius
+    else:
+        # x=r*sin(phi), y=r*(1-cos(phi)), z=a*sin(phi)
+        # 对 phi 的一、二阶导数模长都不超过 sqrt(r^2+a^2)。
+        first_derivative_bound = math.hypot(radius, vertical_amplitude)
+        second_derivative_bound = first_derivative_bound
+
+    phase_rate_peak = _TWO_PI * _PEAK_FIRST_DERIVATIVE
+    phase_accel_peak = _TWO_PI * _PEAK_SECOND_DERIVATIVE
+    return max(
+        phase_rate_peak * first_derivative_bound / max_speed,
+        math.sqrt(
+            (phase_rate_peak**2 * second_derivative_bound
+             + phase_accel_peak * first_derivative_bound)
+            / max_accel
+        ),
+    )
+
+
+@dataclass(frozen=True)
+class TrajectoryCycle:
+    """可重复执行的闭合三维参考轨迹。
+
+    ``sample()`` 的输出是相对于调用方悬停原点的 ENU 位移、速度和加速度。调用方
+    可安全地把多个周期首尾相接：边界处的速度和加速度严格为零，故不会把上一个周期
+    的末端状态作为下一个周期的突变初值。
+    """
+
+    pattern: str
+    radius: float
+    vertical_amplitude: float
+    max_speed: float
+    max_accel: float
+
+    def __post_init__(self) -> None:
+        # 在构造期校验，避免飞行循环开始后才报参数错误。
+        trajectory_duration(
+            self.pattern,
+            self.radius,
+            self.vertical_amplitude,
+            self.max_speed,
+            self.max_accel,
+        )
+
+    @property
+    def duration(self) -> float:
+        return trajectory_duration(
+            self.pattern,
+            self.radius,
+            self.vertical_amplitude,
+            self.max_speed,
+            self.max_accel,
+        )
+
+    def sample(self, elapsed: float) -> tuple[Vector3, Vector3, Vector3]:
+        """返回相对 ENU 的 ``(位置, 速度, 加速度)``，周期外安全保持在原点。"""
+
+        if elapsed <= 0.0 or elapsed >= self.duration:
+            return (0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)
+
+        tau = elapsed / self.duration
+        phase = _TWO_PI * _s(tau)
+        phase_rate = _TWO_PI * _s_dot(tau) / self.duration
+        phase_accel = _TWO_PI * _s_ddot(tau) / self.duration**2
+        position, first_derivative, second_derivative = self._path_derivatives(phase)
+        velocity = tuple(value * phase_rate for value in first_derivative)
+        acceleration = tuple(
+            second_derivative[index] * phase_rate**2
+            + first_derivative[index] * phase_accel
+            for index in range(3)
+        )
+        return position, velocity, acceleration  # type: ignore[return-value]
+
+    def _path_derivatives(self, phase: float) -> tuple[Vector3, Vector3, Vector3]:
+        sine = math.sin(phase)
+        cosine = math.cos(phase)
+        radius = self.radius
+        if self.pattern == "circle":
+            return (
+                (radius * sine, radius * (1.0 - cosine), 0.0),
+                (radius * cosine, radius * sine, 0.0),
+                (-radius * sine, radius * cosine, 0.0),
+            )
+        if self.pattern == "figure8":
+            sine_twice = math.sin(2.0 * phase)
+            cosine_twice = math.cos(2.0 * phase)
+            return (
+                (radius * sine, 0.5 * radius * sine_twice, 0.0),
+                (radius * cosine, radius * cosine_twice, 0.0),
+                (-radius * sine, -2.0 * radius * sine_twice, 0.0),
+            )
+
+        amplitude = self.vertical_amplitude
+        return (
+            (radius * sine, radius * (1.0 - cosine), amplitude * sine),
+            (radius * cosine, radius * sine, amplitude * cosine),
+            (-radius * sine, radius * cosine, -amplitude * sine),
+        )

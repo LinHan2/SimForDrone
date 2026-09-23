@@ -16,7 +16,37 @@ cd /data/disk2/home/hl/research/SimForDrone
 ```
 
 运行前确保没有 QGroundControl 或其它进程占用相同 MAVLink 端口。每次任务记录在
-`logs/px4ctrl/<任务>-<角色>-<时间>/run.json`。
+`logs/px4ctrl/<任务>-<角色>-<时间>/run.json`。飞行任务安全收尾后会自动在同目录生成
+`response.png`；绘图失败不会影响 LAND、上锁或任务返回码。
+
+### 阶跃响应与参数整定
+
+不要用双机跟踪或肉眼观察悬停来整定 tracker。先对 tracker 单机运行可重复的单轴位置
+阶跃，再依据记录的响应指标调整参数。控制器实现在 `px4ctrl/px4ctrl/controller.py`：位置
+外环由 `Kp0/1/2`、`Kv0/1/2` 决定，若启用 SO(3) body-rate 模式，姿态外环再由
+`KAngR/P/Y`、`so3.rate_damping` 和 `so3.max_bodyrate` 决定。
+
+SO(3) 首轮只使用临时 profile，不修改 `sim.yaml`：
+
+```bash
+./scripts/run_px4ctrl.sh step-response --role tracker \
+  --config /tmp/sim-so3.yaml \
+  --step-axis east --step-amplitude 0.5 --step-delay 5 --hold-seconds 12 \
+  --execute
+```
+
+该任务先起飞并悬停，等待 5 秒后沿一个 ENU 轴施加 $0.5\,\mathrm{m}$ 阶跃，持续刷新
+`CMD_CTRL`，并沿用倾角持续饱和回退与自动降落上锁。`run.json` 会记录本轮完整控制参数、
+`rise_time_s`、`overshoot_m`、`settling_time_s`、`final_error_m`、最大倾角、最大 body-rate
+与安全回退状态。
+
+整定顺序固定为：先在四元数模式下整定 `Kp/Kv` 的位置阶跃；SO(3) 模式只在同一位置参数
+稳定后，以低 `KAng`/低 body-rate 上限逐步提高。任一试验出现 `safety_fallback=true`、持续
+倾角饱和或 yaw 往复时，停止加大增益，先降低 `KAngY` 或 `max_bodyrate` 并重新做单机阶跃。
+
+target 与 tracker 的飞行记录也会自动出图：target 图显示本机 local ENU 实际航迹、轨迹参考
+和航点误差；tracker 图显示共享 ENU 下的 target、tracker、期望站位三轴响应，以及跟踪和量测
+误差。图像与同目录 `run.json` 一一对应，便于在每轮调参后直接比较。
 
 ## 推力与油门模型标定
 
@@ -69,7 +99,7 @@ PYTHONPATH=px4ctrl:tracking PX4-Autopilot/.venv/bin/python \
   -m unittest discover -s tracking/tests -p 'test_*.py'
 ```
 
-当前完整套件为 67 项。修改 Python 后可额外执行：
+当前完整套件为 74 项。修改 Python 后可额外执行：
 
 ```bash
 PYTHONPATH=px4ctrl:tracking PX4-Autopilot/.venv/bin/python \

@@ -10,6 +10,7 @@
 ``measure-hover``      用位置模式悬停，记录执行器指令以标定 ``hover_percentage``
 ``takeoff-hover-land`` 用姿态+推力控制完成 自动起飞 → 悬停 → 降落 → 上锁
 ``hold``               保持相对起点的站位（T2 的最小可用形态）
+``step-response``      单轴位置阶跃，用于辨识位置/姿态级联闭环并整定参数
 
 用法::
 
@@ -31,9 +32,10 @@ from typing import Any, Callable
 
 from px4ctrl.controller import LinearControl
 from px4ctrl.fsm import PX4CtrlFSM, State
-from px4ctrl.inputs import vlen, yaw_from_quaternion
+from px4ctrl.inputs import CommandData, vlen, yaw_from_quaternion
 from px4ctrl.link import MavlinkLink
 from px4ctrl.params import Params, ParamError, load_params
+from px4ctrl.plotting import write_response_plot
 from px4ctrl.vehicle import available_roles, resolve_role
 
 DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "config" / "sim.yaml"
@@ -48,6 +50,7 @@ KEEP_RUNS = 20
 
 #: 站位保持的稳态误差门槛（m），取自规划文档对 T2 的验收标准。
 HOLD_STEADY_TOLERANCE_M = 0.5
+STEP_RESPONSE_TOLERANCE_RATIO = 0.1
 
 
 def prune_runs(root: Path, keep: int = KEEP_RUNS) -> None:
@@ -89,11 +92,66 @@ def thrust_model_record(fsm: PX4CtrlFSM) -> dict[str, Any]:
     }
 
 
+def control_params_record(params: Params) -> dict[str, Any]:
+    """记录本轮实际生效的关键控制参数，供仿真/真机调参横向比较。"""
+
+    return {
+        "max_angle_deg": params.max_angle,
+        "gain": {
+            "Kp": [params.gain.kp0, params.gain.kp1, params.gain.kp2],
+            "Kv": [params.gain.kv0, params.gain.kv1, params.gain.kv2],
+            "KAng": [params.gain.kang_r, params.gain.kang_p, params.gain.kang_y],
+        },
+        "so3": {
+            "enabled": params.use_bodyrate_ctrl,
+            "rate_damping": params.so3.rate_damping,
+            "max_bodyrate_rad_s": params.so3.max_bodyrate,
+        },
+        "hover_percentage": params.thrust_model.hover_percentage,
+    }
+
+
+def step_response_metrics(samples: list[dict[str, float]], amplitude: float) -> dict[str, float | None]:
+    """从阶跃后的采样计算可用于整定的响应指标。
+
+    ``position`` 是相对阶跃前悬停点、沿测试轴的位移。指标以阶跃方向归一化，故正、负
+    阶跃可以直接比较；不足以达到 90% 目标时上升时间和整定时间明确记为 ``None``。
+    """
+
+    if not samples or amplitude == 0.0:
+        return {
+            "rise_time_s": None,
+            "settling_time_s": None,
+            "overshoot_m": None,
+            "final_error_m": None,
+        }
+
+    direction = 1.0 if amplitude > 0.0 else -1.0
+    magnitude = abs(amplitude)
+    response = [direction * sample["position"] for sample in samples]
+    times = [sample["t"] for sample in samples]
+    rise_time = next((time_value for time_value, value in zip(times, response) if value >= 0.9 * magnitude), None)
+    overshoot = max(0.0, max(response) - magnitude)
+    final_error = magnitude - (sum(response[-min(len(response), 20):]) / min(len(response), 20))
+    tolerance = STEP_RESPONSE_TOLERANCE_RATIO * magnitude
+    last_outside = max(
+        (index for index, value in enumerate(response) if abs(value - magnitude) > tolerance),
+        default=-1,
+    )
+    settling_time = None if last_outside == len(samples) - 1 else times[last_outside + 1]
+    return {
+        "rise_time_s": rise_time,
+        "settling_time_s": settling_time,
+        "overshoot_m": overshoot,
+        "final_error_m": final_error,
+    }
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "task",
-        choices=["probe", "measure-hover", "takeoff-hover-land", "hold"],
+        choices=["probe", "measure-hover", "takeoff-hover-land", "hold", "step-response"],
         help="要执行的任务",
     )
     parser.add_argument("--role", choices=available_roles(), default="target")
@@ -106,6 +164,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--offset-north", type=float, default=None)
     parser.add_argument("--offset-east", type=float, default=None)
     parser.add_argument("--hold-seconds", type=float, default=None)
+    parser.add_argument(
+        "--step-axis",
+        choices=("east", "north", "up"),
+        default="east",
+        help="step-response 的 ENU 测试轴",
+    )
+    parser.add_argument("--step-amplitude", type=float, default=0.5, help="阶跃幅值（m，可为负）")
+    parser.add_argument("--step-delay", type=float, default=5.0, help="进入悬停后施加阶跃前的等待时间（s）")
     parser.add_argument("--ready-timeout", type=float, default=None)
     parser.add_argument("--landing-timeout", type=float, default=None)
     parser.add_argument("--disarm-timeout", type=float, default=None)
@@ -210,7 +276,9 @@ def enter_offboard(link: MavlinkLink, fsm: PX4CtrlFSM, log: Callable[[str], None
         fsm.tick()
         time.sleep(0.01)
 
-    log(f"ARM: {link.arm(tick=fsm.tick)}")
+    if link.params.force_arm:
+        log("ARM：仿真配置跳过 PX4 preflight 检查")
+    log(f"ARM: {link.arm(force=link.params.force_arm, tick=fsm.tick)}")
     log(f"OFFBOARD: {link.set_offboard(tick=fsm.tick)}")
 
     deadline = time.monotonic() + 5.0
@@ -355,6 +423,8 @@ def run_measure_hover(
 
     samples: list[float] = []
     altitudes: list[float] = []
+    series: list[dict[str, float]] = []
+    started = time.monotonic()
     rate = 1.0 / args.rate_hz
     deadline = time.monotonic() + 8.0 + args.hold_seconds
     while time.monotonic() < deadline:
@@ -363,6 +433,13 @@ def run_measure_hover(
         if link.odom.recv_time > 0.0 and link.mean_actuator is not None:
             altitude_now = link.odom.p[2] - home[2]
             altitudes.append(altitude_now)
+            series.append(
+                {
+                    "t": time.monotonic() - started,
+                    "altitude": altitude_now,
+                    "actuator": link.mean_actuator if link.mean_actuator is not None else 0.0,
+                }
+            )
             # 只有接近目标高度、且垂直速度很小的样本才用于标定。
             if altitude_now > altitude - 0.3 and abs(link.odom.v[2]) < 0.15:
                 samples.append(link.mean_actuator)
@@ -380,6 +457,7 @@ def run_measure_hover(
         "max_altitude": max(altitudes) if altitudes else None,
         "hover_samples": len(samples),
         "suggested_hover_percentage": suggested,
+        "samples": series[:: max(1, len(series) // 300)],
         **result,
     }
 
@@ -510,8 +588,107 @@ def run_hold(
     }
 
 
+def run_step_response(
+    link: MavlinkLink, fsm: PX4CtrlFSM, args: argparse.Namespace, log: Callable[[str], None]
+) -> dict[str, Any]:
+    """执行单轴位置阶跃并记录可重复的闭环响应。
+
+    阶跃在起飞并稳定悬停后才施加，前置等待阶段用于分离起飞交接瞬态。测试期间仍逐周期
+    刷新 ``CMD_CTRL``，保留既有倾角饱和回退；触发回退时停止评估响应但仍走正常降落收尾。
+    """
+
+    axis_index = {"east": 0, "north": 1, "up": 2}[args.step_axis]
+    enter_offboard(link, fsm, log)
+    fsm.request_takeoff(time.monotonic())
+    rate = 1.0 / args.rate_hz
+    takeoff_deadline = time.monotonic() + 45.0
+    while time.monotonic() < takeoff_deadline:
+        fsm.process(time.monotonic())
+        if fsm.state == State.AUTO_HOVER:
+            break
+        time.sleep(rate)
+    else:
+        raise RuntimeError("阶跃测试起飞后 45s 内未进入 AUTO_HOVER")
+
+    log(f"STEP：悬停预稳 {args.step_delay:.1f}s，随后沿 ENU {args.step_axis} 阶跃 {args.step_amplitude:+.2f} m")
+    pre_step_end = time.monotonic() + args.step_delay
+    while time.monotonic() < pre_step_end:
+        fsm.process(time.monotonic())
+        time.sleep(rate)
+
+    origin = link.odom.p
+    target_p = (
+        origin[0] + (args.step_amplitude if axis_index == 0 else 0.0),
+        origin[1] + (args.step_amplitude if axis_index == 1 else 0.0),
+        origin[2] + (args.step_amplitude if axis_index == 2 else 0.0),
+    )
+    fsm.request_command_control()
+    started = time.monotonic()
+    deadline = started + args.hold_seconds
+    samples: list[dict[str, float]] = []
+    fallback = False
+    while time.monotonic() < deadline:
+        now = time.monotonic()
+        fsm.set_command(CommandData(p=target_p, yaw=fsm.hover_yaw), now=now)
+        output = fsm.process(now)
+        if fsm.state != State.CMD_CTRL:
+            fallback = True
+            log("WARN: 阶跃测试触发保护性悬停，停止采样并准备降落")
+            break
+        relative_position = link.odom.p[axis_index] - origin[axis_index]
+        samples.append(
+            {
+                "t": now - started,
+                "position": relative_position,
+                "velocity": link.odom.v[axis_index],
+                "roll_rad": fsm.controller.debug.roll,
+                "pitch_rad": fsm.controller.debug.pitch,
+                "bodyrate_roll": output.bodyrates[0],
+                "bodyrate_pitch": output.bodyrates[1],
+                "bodyrate_yaw": output.bodyrates[2],
+                "tilt_saturated": float(fsm.controller.debug.tilt_saturated),
+            }
+        )
+        time.sleep(rate)
+
+    metrics = step_response_metrics(samples, args.step_amplitude)
+    result = finish(link, fsm, args.landing_timeout, log, args.disarm_timeout)
+    max_tilt_deg = max(
+        (math.degrees(math.hypot(sample["roll_rad"], sample["pitch_rad"])) for sample in samples),
+        default=0.0,
+    )
+    max_bodyrate = max(
+        (
+            max(abs(sample["bodyrate_roll"]), abs(sample["bodyrate_pitch"]), abs(sample["bodyrate_yaw"]))
+            for sample in samples
+        ),
+        default=0.0,
+    )
+    return {
+        "step": {
+            "axis": args.step_axis,
+            "amplitude_m": args.step_amplitude,
+            "delay_s": args.step_delay,
+            "target_local_enu": target_p,
+            "origin_local_enu": origin,
+        },
+        "response": metrics,
+        "max_tilt_deg": max_tilt_deg,
+        "max_bodyrate_rad_s": max_bodyrate,
+        "tilt_saturated_cycles": sum(int(sample["tilt_saturated"]) for sample in samples),
+        "safety_fallback": fallback,
+        "sample_count": len(samples),
+        "samples": samples[:: max(1, len(samples) // 300)],
+        **result,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.step_amplitude == 0.0:
+        raise ParamError("step-amplitude 不能为 0")
+    if args.step_delay < 0.0:
+        raise ParamError("step-delay 必须非负")
     params, role = resolve_params(args)
     output_dir = args.output_root / f"{args.task}-{role.name}-{time.strftime('%Y%m%d-%H%M%S')}"
     prune_runs(args.output_root)
@@ -524,6 +701,7 @@ def main(argv: list[str] | None = None) -> int:
         "rate_hz": args.rate_hz,
         "control_mode": "so3_bodyrate" if params.use_bodyrate_ctrl else "quaternion_attitude",
         "so3_max_bodyrate_rad_s": params.so3.max_bodyrate,
+        "control_params": control_params_record(params),
         "connection": params.link.connection or role.sim_connection,
         "expected_system_id": role.system_id,
     }
@@ -548,6 +726,8 @@ def main(argv: list[str] | None = None) -> int:
             record.update(run_takeoff_hover_land(link, fsm, args, print))
         elif args.task == "hold":
             record.update(run_hold(link, fsm, args, print))
+        elif args.task == "step-response":
+            record.update(run_step_response(link, fsm, args, print))
 
         # 推力模型的最终值与统计：无论是否开启在线估计都记录，便于对比。
         record["thrust_model"] = thrust_model_record(fsm)
@@ -562,6 +742,14 @@ def main(argv: list[str] | None = None) -> int:
             # 判定，否则爬升/交接瞬态会掩盖真实的保持精度。
             steady = record.get("steady_error_mean_m")
             passed = passed and steady is not None and steady <= HOLD_STEADY_TOLERANCE_M
+        elif args.task == "step-response":
+            response = record["response"]
+            passed = (
+                passed
+                and not record["safety_fallback"]
+                and record["sample_count"] > 0
+                and response["rise_time_s"] is not None
+            )
         record["passed"] = passed
         print(f"{'PASS' if passed else 'FAIL'}: {args.task}")
         return 0 if passed else 1
@@ -585,6 +773,11 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     finally:
         write_log(output_dir, record)
+        plot_path = write_response_plot(output_dir, record)
+        if plot_path is not None:
+            record["response_plot"] = plot_path.name
+            write_log(output_dir, record)
+            print(f"PLOT: {plot_path}")
         link.close()
         print(f"LOG: {output_dir}")
 

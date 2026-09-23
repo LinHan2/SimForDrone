@@ -10,12 +10,15 @@ class TargetWaypointTest(unittest.TestCase):
     def test_parse_interactive_waypoint(self) -> None:
         self.assertEqual(parse_interactive_command("1 2 3"), ("waypoint", (1.0, 2.0, 3.0)))
 
-    def test_probe_duration_default_is_long_enough_for_second_process(self) -> None:
+    def test_direct_execution_is_default_and_probe_is_explicit(self) -> None:
         with patch("sys.argv", ["target_waypoints.py"]):
-            self.assertEqual(parse_args().probe_seconds, 15.0)
+            self.assertFalse(parse_args().probe)
 
-        with patch("sys.argv", ["target_waypoints.py", "--probe-seconds", "3"]):
-            self.assertEqual(parse_args().probe_seconds, 3.0)
+        with patch("sys.argv", ["target_waypoints.py", "--probe"]):
+            self.assertTrue(parse_args().probe)
+
+        with patch("sys.argv", ["target_waypoints.py", "--execute"]):
+            self.assertFalse(parse_args().probe)
 
     def test_default_waypoint_limits_reserve_tilt_budget_for_feedback(self) -> None:
         with patch("sys.argv", ["target_waypoints.py"]):

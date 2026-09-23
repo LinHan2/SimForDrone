@@ -58,6 +58,10 @@ $Log(R^T R_d)$ 姿态误差和角速度误差构造 FLU body-rate 设定点，�
 # 姿态+推力控制：自动起飞 → 悬停 → 降落 → 上锁
 ./scripts/run_px4ctrl.sh takeoff-hover-land --role target --execute
 
+# 单机东向 0.5 m 阶跃：记录上升时间、超调、整定时间与保护触发，供参数整定
+./scripts/run_px4ctrl.sh step-response --role tracker --step-axis east \
+   --step-amplitude 0.5 --step-delay 5 --hold-seconds 12 --execute
+
 # 真机：先改 link 段，再用同一入口
 ./scripts/run_px4ctrl.sh takeoff-hover-land --role tracker --profile real --execute
 ```
@@ -134,6 +138,13 @@ shared_frame:
 
 临时试验用 `--config <临时yaml>` 覆盖，不要改动基线。整定所需的时间序列见 `hold` 任务
 输出中的 `samples` 与 `steady_*` 指标。
+
+位置动态整定使用 `step-response`：先在单机、单轴、小幅阶跃条件下调整 `Kp0/1/2` 与
+`Kv0/1/2`，再启用 SO(3) body-rate 模式调整 `KAngR/P/Y`、`so3.rate_damping` 和
+`so3.max_bodyrate`。任务日志会写入阶跃的 `rise_time_s`、`overshoot_m`、
+`settling_time_s`、末段误差、倾角/角速度峰值、保护回退状态和完整生效控制参数；不要用
+双机跟踪任务直接整定这些参数。任务收尾后会在同一日志目录生成 `response.png`；绘图仅在
+LAND/上锁之后进行，失败不会影响飞行任务结果。
 
 ## 自检
 

@@ -79,6 +79,9 @@ link:
   target_system: 0   # 0 表示沿用角色定义；非零时用于覆盖
   target_component: 1
   heartbeat_timeout: 15.0
+  # Pegasus SITL 未提供 PX4 全部 preflight 健康输入，普通 ARM 会持续回
+  # TEMPORARILY_REJECTED。此开关仅用于仿真，真机配置必须保持 false。
+  force_arm: true
 
 # 多机共享位置坐标系。
 # 各机 PX4 EKF 的 LOCAL_POSITION_NED 原点由各自起飞点建立，位置不可跨机比较；

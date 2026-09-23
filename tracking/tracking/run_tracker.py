@@ -15,6 +15,7 @@ from px4ctrl.fsm import PX4CtrlFSM, State
 from px4ctrl.inputs import CommandData
 from px4ctrl.link import MavlinkLink
 from px4ctrl.params import load_params
+from px4ctrl.plotting import write_response_plot
 from px4ctrl.vehicle import resolve_role
 from tracking.estimation import NoisyTargetSensor, PassthroughEstimator, select_target_state
 from tracking.guidance import ObserverState, PositionTrackerV0
@@ -26,7 +27,9 @@ DEFAULT_CONFIG = ROOT / "px4ctrl" / "config" / "sim.yaml"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--execute", action="store_true", help="真正控制 tracker；默认仅探测")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--probe", action="store_true", help="仅检查 tracker 遥测与 target 状态流，不解锁")
+    mode.add_argument("--execute", action="store_false", dest="probe", help="兼容旧命令；现在默认直接执行")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--duration", type=float, default=30.0, help="跟踪时长（s）；0 表示一直跟踪到中断或目标状态超时")
     parser.add_argument("--offset-east", type=float, default=None)
@@ -96,14 +99,15 @@ def main() -> int:
     fsm = PX4CtrlFSM(params, LinearControl(params), link, log=lambda message: print(f"[tracker] {message}"))
     subscriber = TargetStateSubscriber(args.state_host, args.state_port)
     output_dir = args.output_root / f"tracker-v0-{time.strftime('%Y%m%d-%H%M%S')}"
-    record: dict[str, object] = {"task": "tracker-v0", "execute": args.execute, "state_source": args.state_source}
+    record: dict[str, object] = {"task": "tracker-v0", "execute": not args.probe, "state_source": args.state_source}
+    samples: list[dict[str, float]] = []
 
     try:
         link.open()
         wait_ready(link, fsm, defaults.ready_timeout, print)
         wait_tracker_shared(link, fsm, defaults.ready_timeout)
         target_message = wait_target_state(subscriber, defaults.ready_timeout, args.state_timeout)
-        if not args.execute:
+        if args.probe:
             print(f"DRY RUN PASS: tracker 与 target 状态流已就绪，target={target_message.p}")
             record["result"] = "dry_run_probe_ok"
             return 0
@@ -143,7 +147,6 @@ def main() -> int:
         estimator = PassthroughEstimator()
         fsm.request_command_control()
         record["relative_offset"] = relative_offset
-        samples: list[dict[str, float]] = []
         started = time.monotonic()
         next_status = started
         # duration == 0 表示持续跟踪直到 Ctrl-C 或 target 状态超时；
@@ -167,6 +170,15 @@ def main() -> int:
                     "error": error,
                     "measurement_error": math.dist(measurement.p, truth.p) if measurement else 0.0,
                     "thrust": output.thrust,
+                    "target_e": truth.p[0],
+                    "target_n": truth.p[1],
+                    "target_u": truth.p[2],
+                    "tracker_e": link.shared_position[0],
+                    "tracker_n": link.shared_position[1],
+                    "tracker_u": link.shared_position[2],
+                    "desired_e": desired_shared[0],
+                    "desired_n": desired_shared[1],
+                    "desired_u": desired_shared[2],
                 }
             )
             if args.status_period > 0.0 and now >= next_status:
@@ -203,8 +215,17 @@ def main() -> int:
             record.update(finish(link, fsm, defaults.landing_timeout, print, defaults.disarm_timeout))
         return 1
     finally:
+        if samples and "samples" not in record:
+            record["samples"] = samples[:: max(1, len(samples) // 300)]
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "run.json").write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        plot_path = write_response_plot(output_dir, record)
+        if plot_path is not None:
+            record["response_plot"] = plot_path.name
+            (output_dir / "run.json").write_text(
+                json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+            )
+            print(f"PLOT: {plot_path}")
         subscriber.close()
         link.close()
         print(f"LOG: {output_dir}")

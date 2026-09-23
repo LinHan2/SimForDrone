@@ -142,6 +142,8 @@ class LinkParams:
     target_system: int
     target_component: int = 1
     heartbeat_timeout: float = 15.0
+    #: 仅仿真可用：通过 MAVLink force 参数跳过 PX4 preflight 检查。真机必须保持 false。
+    force_arm: bool = False
 
 
 @dataclass(frozen=True)
@@ -308,6 +310,7 @@ def load_params(path: str | Path) -> Params:
             target_system=int(_require(link, "target_system")),
             target_component=int(link.get("target_component", 1)),
             heartbeat_timeout=float(link.get("heartbeat_timeout", 15.0)),
+            force_arm=bool(link.get("force_arm", False)),
         ),
         tasks=TaskDefaults(
             altitude=float(task.get("altitude", 2.0)),

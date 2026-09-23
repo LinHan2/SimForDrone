@@ -16,6 +16,7 @@ from px4ctrl.fsm import PX4CtrlFSM, State
 from px4ctrl.inputs import CommandData
 from px4ctrl.link import MavlinkLink
 from px4ctrl.params import load_params
+from px4ctrl.plotting import write_response_plot
 from px4ctrl.vehicle import resolve_role
 from tracking.guidance import TargetState, Vector3
 from tracking.state_io import DEFAULT_STATE_HOST, DEFAULT_STATE_PORT, TargetStatePublisher
@@ -27,7 +28,9 @@ DEFAULT_CONFIG = ROOT / "px4ctrl" / "config" / "sim.yaml"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--execute", action="store_true", help="真正控制 target；默认仅探测")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--probe", action="store_true", help="仅检查 target 遥测与共享状态发布，不解锁")
+    mode.add_argument("--execute", action="store_false", dest="probe", help="兼容旧命令；现在默认直接执行")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--interactive", action="store_true", help="起飞后从终端非阻塞读取手动航点")
     parser.add_argument(
@@ -166,7 +169,19 @@ def run_interactive(
         fsm.process(now)
         publish_state(link, publisher, now)
         error = math.dist(link.odom.p, waypoint)
-        samples.append({"t": now, "waypoint": float(waypoint_index), "error": error})
+        samples.append(
+            {
+                "t": now,
+                "waypoint": float(waypoint_index),
+                "error": error,
+                "actual_e": link.odom.p[0],
+                "actual_n": link.odom.p[1],
+                "actual_u": link.odom.p[2],
+                "reference_e": reference_p[0],
+                "reference_n": reference_p[1],
+                "reference_u": reference_p[2],
+            }
+        )
 
         # 零超时轮询：有输入才读，没有输入不等待，控制循环节奏不受键盘影响。
         readable, _, _ = select.select([sys.stdin], [], [], 0.0)
@@ -247,13 +262,14 @@ def main() -> int:
     fsm = PX4CtrlFSM(params, LinearControl(params), link, log=lambda message: print(f"[target] {message}"))
     publisher = TargetStatePublisher(args.state_host, args.state_port)
     output_dir = args.output_root / f"target-waypoints-{time.strftime('%Y%m%d-%H%M%S')}"
-    record: dict[str, object] = {"task": "target-waypoints", "points": points, "execute": args.execute}
+    record: dict[str, object] = {"task": "target-waypoints", "points": points, "execute": not args.probe}
+    samples: list[dict[str, float]] = []
 
     try:
         link.open()
         wait_ready(link, fsm, defaults.ready_timeout, print)
         wait_shared_position(link, fsm, defaults.ready_timeout)
-        if not args.execute:
+        if args.probe:
             print(f"target dry-run：连续发布共享状态 {args.probe_seconds:.1f}s，未发送控制命令")
             deadline = time.monotonic() + args.probe_seconds
             while time.monotonic() < deadline:
@@ -295,7 +311,6 @@ def main() -> int:
                 link, fsm, publisher, home, rate, args.tolerance, args.max_speed, args.max_accel
             )
         else:
-            samples = []
             # 只需在首个航段前切一次指令控制状态。
             command_mode_requested = False
             # 下一个状态打印时刻（1 Hz）。
@@ -326,7 +341,19 @@ def main() -> int:
                     fsm.process(now)
                     publish_state(link, publisher, now)
                     error = math.dist(link.odom.p, waypoint)
-                    samples.append({"t": now, "waypoint": float(index), "error": error})
+                    samples.append(
+                        {
+                            "t": now,
+                            "waypoint": float(index),
+                            "error": error,
+                            "actual_e": link.odom.p[0],
+                            "actual_n": link.odom.p[1],
+                            "actual_u": link.odom.p[2],
+                            "reference_e": reference_p[0],
+                            "reference_n": reference_p[1],
+                            "reference_u": reference_p[2],
+                        }
+                    )
                     # 同时打印 local 与 shared 两套坐标：local 是控制器与收敛判据所用，
                     # shared 是 tracker 看到的。两者保持固定偏移 ⇒ 真实运动；
                     # 两者发散 ⇒ 问题在估计/坐标系，而非控制。
@@ -381,8 +408,17 @@ def main() -> int:
             record.update(finish(link, fsm, defaults.landing_timeout, print, defaults.disarm_timeout))
         return 1
     finally:
+        if samples and "samples" not in record:
+            record["samples"] = samples[:: max(1, len(samples) // 300)]
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "run.json").write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        plot_path = write_response_plot(output_dir, record)
+        if plot_path is not None:
+            record["response_plot"] = plot_path.name
+            (output_dir / "run.json").write_text(
+                json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+            )
+            print(f"PLOT: {plot_path}")
         publisher.close()
         link.close()
         print(f"LOG: {output_dir}")
