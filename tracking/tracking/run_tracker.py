@@ -15,7 +15,7 @@ from px4ctrl.fsm import PX4CtrlFSM, State
 from px4ctrl.inputs import CommandData
 from px4ctrl.link import MavlinkLink
 from px4ctrl.params import load_params
-from px4ctrl.plotting import write_response_plot
+from px4ctrl.plotting import PICTURE_DIR, write_response_plot
 from px4ctrl.vehicle import resolve_role
 from tracking.estimation import NoisyTargetSensor, PassthroughEstimator, select_target_state
 from tracking.guidance import ObserverState, PositionTrackerV0
@@ -41,6 +41,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--velocity-noise-std", type=float, default=0.02)
     parser.add_argument("--noise-seed", type=int, default=0)
     parser.add_argument("--state-timeout", type=float, default=0.5)
+    parser.add_argument(
+        "--settling-seconds",
+        type=float,
+        default=5.0,
+        help="统计动态跟踪误差时排除起飞/初始站位调整的时长（s）",
+    )
     parser.add_argument("--status-period", type=float, default=1.0, help="实时状态输出周期（s），0 表示关闭")
     parser.add_argument("--state-host", default=DEFAULT_STATE_HOST)
     parser.add_argument("--state-port", type=int, default=DEFAULT_STATE_PORT)
@@ -91,8 +97,13 @@ def command_from_reference(reference) -> CommandData:
 
 def main() -> int:
     args = parse_args()
-    if args.duration < 0.0 or args.state_timeout <= 0.0 or args.status_period < 0.0:
-        raise ValueError("duration 不得为负，state-timeout 必须为正，status-period 不得为负")
+    if (
+        args.duration < 0.0
+        or args.state_timeout <= 0.0
+        or args.status_period < 0.0
+        or args.settling_seconds < 0.0
+    ):
+        raise ValueError("duration/status-period/settling-seconds 不得为负，state-timeout 必须为正")
     params = load_params(args.config)
     defaults = task_defaults(params)
     link = MavlinkLink(params.link, resolve_role("tracker"), shared_frame=params.shared_frame)
@@ -179,6 +190,8 @@ def main() -> int:
                     "desired_e": desired_shared[0],
                     "desired_n": desired_shared[1],
                     "desired_u": desired_shared[2],
+                    "tilt_saturated": float(fsm.controller.debug.tilt_saturated),
+                    "fsm_cmd_ctrl": float(fsm.state == State.CMD_CTRL),
                 }
             )
             if args.status_period > 0.0 and now >= next_status:
@@ -193,8 +206,16 @@ def main() -> int:
             time.sleep(rate)
 
         record["samples"] = samples[:: max(1, len(samples) // 300)]
-        record["error_mean_m"] = sum(sample["error"] for sample in samples) / len(samples)
-        record["error_max_m"] = max(sample["error"] for sample in samples)
+        evaluation_samples = [sample for sample in samples if sample["t"] >= args.settling_seconds]
+        if not evaluation_samples:
+            evaluation_samples = samples
+        record["settling_seconds"] = args.settling_seconds
+        record["error_mean_m"] = sum(sample["error"] for sample in evaluation_samples) / len(evaluation_samples)
+        record["error_max_m"] = max(sample["error"] for sample in evaluation_samples)
+        record["tilt_saturated_samples"] = sum(
+            int(sample["tilt_saturated"]) for sample in samples
+        )
+        record["cmd_ctrl_fraction"] = sum(sample["fsm_cmd_ctrl"] for sample in samples) / len(samples)
         record.update(finish(link, fsm, defaults.landing_timeout, print, defaults.disarm_timeout))
         passed = bool(record.get("on_ground")) and bool(record.get("disarmed"))
         record["passed"] = passed
@@ -219,13 +240,14 @@ def main() -> int:
             record["samples"] = samples[:: max(1, len(samples) // 300)]
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "run.json").write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        plot_path = write_response_plot(output_dir, record)
+        plot_path = write_response_plot(output_dir, record, picture_dir=PICTURE_DIR)
         if plot_path is not None:
             record["response_plot"] = plot_path.name
+            record["picture_plot"] = str(PICTURE_DIR / f"{output_dir.name}.png")
             (output_dir / "run.json").write_text(
                 json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
             )
-            print(f"PLOT: {plot_path}")
+            print(f"PLOT: {plot_path}；归档: {record['picture_plot']}")
         subscriber.close()
         link.close()
         print(f"LOG: {output_dir}")

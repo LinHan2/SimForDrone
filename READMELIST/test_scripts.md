@@ -70,13 +70,12 @@ target 与 tracker 的飞行记录也会自动出图：target 图显示本机 lo
 这些脚本只读取 ROS 2 或采样文件，不下发飞行控制：
 
 ```bash
-./scripts/check_dual_uav_observation.sh
-./scripts/capture_rgbd_sample.sh
-./scripts/check_observer_rgb_scene.sh
+./scripts/check_observation.sh
+./scripts/check_observation.sh --rgbd
 ```
 
-RGB-D 样本写入 `logs/rgbd_samples/`，场景图像检查写入 `logs/scene_rgb_checks/`。当前相机和
-位姿时间基准尚未对齐，不能把这些观测直接接入视觉控制或 EKF。
+`--rgbd` 样本与场景图像检查均写入 `logs/scene_rgb_checks/`。当前相机和位姿时间基准尚未对齐，
+不能把这些观测直接接入视觉控制或 EKF。
 
 ## 跟踪结果与 ULog
 
@@ -99,7 +98,7 @@ PYTHONPATH=px4ctrl:tracking PX4-Autopilot/.venv/bin/python \
   -m unittest discover -s tracking/tests -p 'test_*.py'
 ```
 
-当前完整套件为 74 项。修改 Python 后可额外执行：
+当前完整套件为 80 项。修改 Python 后可额外执行：
 
 ```bash
 PYTHONPATH=px4ctrl:tracking PX4-Autopilot/.venv/bin/python \

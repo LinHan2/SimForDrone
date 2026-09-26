@@ -35,7 +35,7 @@ from px4ctrl.fsm import PX4CtrlFSM, State
 from px4ctrl.inputs import CommandData, vlen, yaw_from_quaternion
 from px4ctrl.link import MavlinkLink
 from px4ctrl.params import Params, ParamError, load_params
-from px4ctrl.plotting import write_response_plot
+from px4ctrl.plotting import PICTURE_DIR, write_response_plot
 from px4ctrl.vehicle import available_roles, resolve_role
 
 DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "config" / "sim.yaml"
@@ -773,11 +773,12 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     finally:
         write_log(output_dir, record)
-        plot_path = write_response_plot(output_dir, record)
+        plot_path = write_response_plot(output_dir, record, picture_dir=PICTURE_DIR)
         if plot_path is not None:
             record["response_plot"] = plot_path.name
+            record["picture_plot"] = str(PICTURE_DIR / f"{output_dir.name}.png")
             write_log(output_dir, record)
-            print(f"PLOT: {plot_path}")
+            print(f"PLOT: {plot_path}；归档: {record['picture_plot']}")
         link.close()
         print(f"LOG: {output_dir}")
 

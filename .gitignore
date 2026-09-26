@@ -4,5 +4,6 @@ __pycache__/
 
 # Runtime artefacts are referenced from READMELIST, not committed as source.
 logs/
+picture/
 *.etli
 

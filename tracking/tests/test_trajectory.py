@@ -12,6 +12,7 @@ import math
 import unittest
 
 from tracking.trajectory import (
+    TrajectoryCycle,
     WaypointSegment,
     quintic_reference,
     segment_duration,
@@ -91,6 +92,30 @@ class QuinticReferenceTest(unittest.TestCase):
     def test_rejects_non_positive_duration(self) -> None:
         with self.assertRaises(ValueError):
             quintic_reference((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), 0.0, 0.0)
+
+
+class TrajectoryCycleTest(unittest.TestCase):
+    def test_closed_trajectories_have_zero_boundary_derivatives(self) -> None:
+        for pattern in ("circle", "figure8", "helix"):
+            trajectory = TrajectoryCycle(pattern, 1.0, 0.3, 0.25, 0.25)
+            for elapsed in (0.0, trajectory.duration):
+                position, velocity, acceleration = trajectory.sample(elapsed)
+                self.assertEqual(position, (0.0, 0.0, 0.0))
+                self.assertEqual(velocity, (0.0, 0.0, 0.0))
+                self.assertEqual(acceleration, (0.0, 0.0, 0.0))
+
+    def test_trajectory_respects_kinematic_limits(self) -> None:
+        max_speed, max_accel = 0.25, 0.25
+        for pattern in ("circle", "figure8", "helix"):
+            trajectory = TrajectoryCycle(pattern, 1.0, 0.3, max_speed, max_accel)
+            peak_speed = 0.0
+            peak_accel = 0.0
+            for step in range(1, 1_000):
+                _, velocity, acceleration = trajectory.sample(trajectory.duration * step / 1_000)
+                peak_speed = max(peak_speed, math.dist((0.0, 0.0, 0.0), velocity))
+                peak_accel = max(peak_accel, math.dist((0.0, 0.0, 0.0), acceleration))
+            self.assertLessEqual(peak_speed, max_speed + 1e-6, pattern)
+            self.assertLessEqual(peak_accel, max_accel + 1e-6, pattern)
 
 
 if __name__ == "__main__":

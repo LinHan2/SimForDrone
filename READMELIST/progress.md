@@ -10,26 +10,43 @@
 | **px4ctrl 控制环** | **已落地并验证** | 唯一命令执行模块 `px4ctrl/`；姿态+推力闭环：最高 `1.974 m`、稳态误差均值 `0.023 m`、落地并上锁。证据 `logs/px4ctrl/hold-target-20260918-214430/`。 |
 | P2.1-T2：tracker 站位保持 | **已通过** | 稳态误差均值 `0.014 m`、最大 `0.020 m`（门槛 0.5 m）。证据 `logs/px4ctrl/hold-tracker-20260918-214228/`。 |
 | P2.2：多机共享坐标系 | **已实现并实测验证** | `GLOBAL_POSITION_INT` + 共用地理原点换算；与 ROS 真值同时刻对比偏差约 2 cm。 |
-| P2.3-T3：真值双机跟踪 | 进行中 | 静止 target 加噪闭环、target/tracker 双进程 dry-run、target 单机 2 m 往返均已通过；已拆为“target 航点”与“tracker 跟踪”两个独立进程，含手动航点模式与 Isaac 车辆监视窗。下一步是两机同飞复测。 |
-| P3：视觉位姿/EKF | 未开始 | 前置为量化图像与位姿的时间偏差。 |
+| P2.3-T3：真值双机跟踪 | 已飞行，未通过验收 | target 八字轨迹正常完成并安全落地；tracker 可进入跟踪，但后段触发持续倾角饱和并在 target 结束后因状态超时退出。必须先降低动态难度并取得无饱和的双机基准。 |
+| P3：视觉位姿/EKF | 未开始 | `vision/` 仅有模块骨架；前置是完成可重复的真值双机动态基准，并录制带时间戳和真值的仿真图像数据。 |
 
 `vision/` 已建立为独立模块，但按阶段约束暂不接入控制；T3/T4 通过后再以视觉相对位姿替换
 真值输入，所有飞控命令仍统一经过 `px4ctrl/`。
 
 ## 当前检查点
 
-- **已验证**：场景启动、target/tracker 双进程 dry-run、target 单机 2 m 往返、自动降落与
-  上锁；完整 `tracking/tests` 离线回归为 74 项通过。
-- **已知保护性失败**：较快的 `v<=0.8 m/s, a<=1.0 m/s²` target 航段在起步后持续倾角饱和；
-  看门狗转入悬停，人工中断后安全落地。这不是通过项，也没有进入双机阶段。
-- **当前默认边界**：固定航点使用 `v<=0.25 m/s, a<=0.25 m/s²`；只有显式传入命令行参数时
-  才覆盖。末航点保持前切入 `AUTO_HOVER`，不再依赖 CMD 超时保护收尾。
-- **暂停点**：动态真值双机跟踪尚未重新验收；在恢复前先保留本检查点，复飞后必须检查两机
-  ULog 的倾角、姿态翻转、冲击和 EKF 偏置指标。
-- **SO(3) 控制模式**：tracker 单机与双机阶段均观察到 yaw 震荡，不能作为通过验收。ULog
-  表明 rate setpoint 与实际 yaw-rate 在约 150 ms 延迟后同号相关，FRD/FLU 符号正确；问题是
-  延迟下外环带宽过高。已加入单机阶跃任务和低带宽临时 profile，必须先完成阶跃验收。
-  默认配置仍关闭该模式，尚未进行真机验收。
+### 已具备
+
+- 场景、两套 PX4 SITL、WebRTC 与 ROS 2 观测接口已可运行；双机 dry-run、target 单机航点、
+  自动降落与上锁均已验证。
+- `px4ctrl` 是唯一 MAVLink 控制出口；target 与 tracker 各自独占端口，目标状态经本机 UDP 转发。
+- 圆形、八字、螺旋轨迹、真值跟踪指标和响应图已实现；完整 `tracking/tests` 离线回归为 **80 项通过**。
+
+### 最近双机动态结果
+
+- 2026-09-26 的八字试验中，target 完成轨迹并安全落地：
+  `logs/tracking/target-trajectory-20260926-230758/`。
+- tracker 成功起飞并进入跟踪，但后段发生持续倾角饱和，状态机转入 `AUTO_HOVER`；target 落地停止
+  状态发布后，tracker 以目标状态超时安全退出：
+  `logs/tracking/tracker-v0-20260926-230813/`。
+- 因此当前双机动态真值跟踪**没有通过验收**；不能据此开始视觉/EKF 或提高轨迹速度。
+
+### 当前限制
+
+- 固定航点默认使用 `v<=0.25 m/s, a<=0.25 m/s²`；显式命令行参数可覆盖，但不应在双机验收前提高。
+- SO(3) body-rate 模式仍关闭。此前观察到约 $150\,\mathrm{ms}$ 延迟下的 yaw 震荡，必须先完成单机
+  低带宽阶跃验收，不能用于双机或真机。
+- `vision/` 尚未实现数据接入或姿态估计链路，当前只允许将仿真真值用于跟踪基准。
+
+### 下一步
+
+1. 使用比当前八字更保守的速度、加速度和半径，复飞无噪真值双机轨迹。
+2. 验收两端 `on_ground=true`、`disarmed=true`，tracker 的 `tilt_saturated_samples=0`，并检查
+   `cmd_ctrl_fraction`、动态误差和响应图。
+3. 取得无饱和基准后，才用同一轨迹测试 `--state-source estimator`；视觉数据集与网络接入仍排在其后。
 
 ## 最近记录
 
@@ -104,9 +121,16 @@
 | `scripts/run_tracking.sh` | `scripts/run_target_waypoints.sh` + `scripts/run_tracker.sh` | 单进程旧形态（同时占用 14540/14541），文档自述已被取代 |
 | `scripts/record_tracker_takeoff_pose.sh` | `scripts/run_px4ctrl.sh` 的 `hold`/`measure-hover` | P2.0 起降验收已完成，核验统一由 px4ctrl 负责 |
 
-**保留原则：只删 shell 包装，不删底层能力。** `tracking/tracking/run_static.py`、
-`utils/record_tracker_takeoff_pose.py` 都仍在，文档给出直接调用方式；只读诊断类
-（`check_*`、`capture_*`、`show_latest_tracking_result.sh`）因仍服务后续视觉阶段而保留。
+当时遵循“只删 shell 包装，不删底层能力”的原则；该结论已被后续主流程重构取代。
+
+### 清理旧双机测试入口（2026-09-26）
+
+- 删除 `tracking/tracking/run_static.py`：它在单个进程同时拥有 `14540`/`14541`，与当前双进程
+  端口所有权模型冲突，且已没有调用点。
+- 合并 `check_dual_uav_observation.sh`、`capture_rgbd_sample.sh` 与
+  `check_observer_rgb_scene.sh` 为 `scripts/check_observation.sh`；默认检查 ROS 2 话题，
+  `--rgbd` 才额外采样并检查前视图像。
+- 完整 `tracking` 离线回归为 80 项通过。
 
 恢复任一被删脚本（内容都在 git 中，已验证可读出）：
 

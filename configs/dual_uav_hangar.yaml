@@ -1,4 +1,4 @@
-# SimForDrone 双机 Warehouse 场景超参数。修改后必须重启 Isaac 场景才会生效。
+# SimForDrone 双机开放网格场景超参数。修改后必须重启 Isaac 场景才会生效。
 # 可用 SIMFORDRONE_CONFIG=/absolute/path/experiment.yaml 切换到另一组实验参数。
 
 px4:
@@ -32,7 +32,6 @@ viewport:
   target: [0.0, 0.0, 1.5]
 
 environment:
-  # 官方 Isaac Sim 5.1 Full Warehouse：真实货架、叉车、工业材质及预制灯光。
-  # 已于 2026-09-17 验证 HTTP 200；首次场景加载会下载并缓存其依赖。
-  asset_url: https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/Isaac/Environments/Simple_Warehouse/full_warehouse.usd
+  # 官方 Isaac Sim 5.1 开放网格。动态双机试验不受货架/叉车遮挡，便于观察八字轨迹。
+  asset_url: https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/Isaac/Environments/Grid/default_environment.usd
   prim_path: /World/layout

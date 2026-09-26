@@ -63,7 +63,6 @@ tracking/
 │   ├── __init__.py
 │   ├── estimation.py      # 噪声量测、估计器协议与状态源切换
 │   ├── guidance.py        # TargetState → DesiredState 的纯制导
-│   ├── run_static.py      # 早期双机静止目标在线任务与安全收尾
 │   ├── run_tracker.py     # tracker-only 状态订阅与跟踪控制
 │   └── target_waypoints.py # target-only 航点与共享状态发布
 └── tests/
@@ -94,41 +93,5 @@ target 的固定航点默认是保守的 `v<=0.25 m/s, a<=0.25 m/s²`，该参�
 - `scripts/run_target_waypoints.sh --interactive --execute`：手动输入航点；
 - `scripts/run_tracker.sh --duration 0 --execute`：持续跟踪直到中断或目标状态超时。
 
-早期单进程双机入口（同时控制两机，固定静止目标）的 shell 包装 `run_tracking.sh` 已删除，
-底层模块 `tracking/tracking/run_static.py` 保留。先加载控制环境并把调用固定下来：
-
-```bash
-export SIMFORDRONE_ROOT=/data/disk2/home/hl/research/SimForDrone
-source scripts/env/activate_px4_mavlink_control.sh   # 清掉 Conda/ROS 变量
-run_static() { PYTHONPATH=tracking:px4ctrl "${SIMFORDRONE_PX4_PYTHON}" -m tracking.run_static "$@"; }
-```
-
-以下命令中的 `run_static` 即原 `./scripts/run_tracking.sh`。确认通过后，用默认加噪量测和
-占位估计器运行 20 秒：
-
-```bash
-run_static --execute
-```
-
-默认位置噪声 `0.05 m`、速度噪声 `0.02 m/s`、随机种子 `0`。未指定 offset 时，程序会在
-双机起飞稳定后锁存当时的真实相对位置，因此第一轮不会主动拉近两机。无噪真值对照命令：
-
-```bash
-run_static --state-source truth --execute
-```
-
-需要指定站位时再显式传入共享 ENU 偏移，例如目标西侧 3 m：
-
-```bash
-run_static --offset-east -3 --offset-north 0 --offset-up 0 --execute
-```
-
-指定噪声和重复实验：
-
-```bash
-run_static --state-source estimator \
-    --position-noise-std 0.10 --velocity-noise-std 0.05 --noise-seed 7 --execute
-```
-
-运行日志写入 `logs/tracking/static-v0-<时间>/run.json`。飞控命令仍只由 `px4ctrl` 下发；
-按一次 `Ctrl+C` 后等待两机自动 LAND 和上锁。
+早期单进程双机静态测试 `run_static.py` 已删除。它会在同一进程内同时拥有 `14540` 与 `14541`，
+与当前“每个端口一个控制进程”的主路径冲突；双机回归统一使用 target/tracker 独立进程。

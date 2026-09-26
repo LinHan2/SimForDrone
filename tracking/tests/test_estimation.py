@@ -1,7 +1,11 @@
+import math
 import unittest
+
+import numpy as np
 
 from tracking.estimation import NoisyTargetSensor, PassthroughEstimator, select_target_state
 from tracking.guidance import TargetState
+from tracking.relative_ekf import RelativePoseMeasurement, RelativeTargetEKF
 
 
 class EstimationBoundaryTest(unittest.TestCase):
@@ -81,6 +85,79 @@ class EstimationBoundaryTest(unittest.TestCase):
         held, lost_measurement = select_target_state("estimator", truth, 3.0, always_lost, estimator)
         self.assertIsNone(lost_measurement)
         self.assertEqual(held, first)
+
+
+class RelativeTargetEKFTest(unittest.TestCase):
+    def test_hover_constraint_uses_enu_gravity_sign(self) -> None:
+        estimator = RelativeTargetEKF()
+        estimate = estimator.update(
+            RelativePoseMeasurement(
+                timestamp=0.0,
+                relative_position=(3.0, -1.0, 0.5),
+                target_thrust_direction=(0.0, 0.0, 1.0),
+            ),
+            observer_acceleration=(0.0, 0.0, 0.0),
+        )
+
+        self.assertLess(math.dist(estimate.target_acceleration, (0.0, 0.0, 0.0)), 1e-8)
+
+    def test_attitude_constraint_is_invariant_to_yaw(self) -> None:
+        first = RelativeTargetEKF().update(
+            RelativePoseMeasurement(0.0, (2.0, 0.0, 1.0), (0.2, 0.0, 0.98)),
+            observer_acceleration=(0.0, 0.0, 0.0),
+        )
+        # 绕世界 z 轴改变 yaw，不改变同一个倾角对应的推力方向与重力夹角。
+        second = RelativeTargetEKF().update(
+            RelativePoseMeasurement(0.0, (2.0, 0.0, 1.0), (0.0, 0.2, 0.98)),
+            observer_acceleration=(0.0, 0.0, 0.0),
+        )
+
+        self.assertAlmostEqual(
+            math.dist(first.target_acceleration, (0.0, 0.0, -9.81)),
+            math.dist(second.target_acceleration, (0.0, 0.0, -9.81)),
+            places=10,
+        )
+
+    def test_constant_velocity_estimate_converges(self) -> None:
+        estimator = RelativeTargetEKF(position_std=0.03, acceleration_process_std=0.2)
+        estimate = None
+        for step in range(101):
+            timestamp = step * 0.1
+            truth = (2.0 + 0.4 * timestamp, -1.0, 0.5)
+            estimate = estimator.update(
+                RelativePoseMeasurement(timestamp, truth, (0.0, 0.0, 1.0)),
+                observer_acceleration=(0.0, 0.0, 0.0),
+            )
+
+        assert estimate is not None
+        self.assertLess(math.dist(estimate.relative_position, truth), 0.03)
+        self.assertLess(math.dist(estimate.relative_velocity, (0.4, 0.0, 0.0)), 0.05)
+
+    def test_covariance_remains_symmetric_positive_semidefinite(self) -> None:
+        estimator = RelativeTargetEKF(position_std=0.05)
+        for step in range(40):
+            timestamp = step * 0.05
+            estimator.update(
+                RelativePoseMeasurement(
+                    timestamp,
+                    (1.0 + 0.2 * timestamp, -0.5, 0.8),
+                    (0.0, 0.0, 1.0),
+                ),
+                observer_acceleration=(0.0, 0.0, 0.0),
+            )
+
+        covariance = estimator.covariance
+        self.assertTrue(np.all(np.isfinite(covariance)))
+        self.assertTrue(np.allclose(covariance, covariance.T))
+        self.assertGreaterEqual(float(np.min(np.linalg.eigvalsh(covariance))), -1e-9)
+
+    def test_rejects_non_increasing_timestamps(self) -> None:
+        estimator = RelativeTargetEKF()
+        measurement = RelativePoseMeasurement(1.0, (1.0, 0.0, 0.0), (0.0, 0.0, 1.0))
+        estimator.update(measurement, (0.0, 0.0, 0.0))
+
+        with self.assertRaises(ValueError):
+            estimator.update(measurement, (0.0, 0.0, 0.0))
 
 
 if __name__ == "__main__":

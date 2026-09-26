@@ -5,9 +5,19 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+PICTURE_DIR = Path(__file__).resolve().parents[2] / "picture"
 
-def write_response_plot(output_dir: Path, record: dict[str, Any]) -> Path | None:
-    """根据任务记录生成 ``response.png``，绘图异常不会影响飞行任务结果。"""
+
+def write_response_plot(
+    output_dir: Path,
+    record: dict[str, Any],
+    picture_dir: Path | None = None,
+) -> Path | None:
+    """生成运行记录图，并可额外归档到独立图片目录。
+
+    ``output_dir/response.png`` 保留与 ``run.json`` 一一对应的原始证据；归档图以运行目录名
+    命名，避免 target 与 tracker 的同名响应图相互覆盖。
+    """
 
     samples = record.get("samples")
     if not isinstance(samples, list) or not samples:
@@ -27,14 +37,18 @@ def write_response_plot(output_dir: Path, record: dict[str, Any]) -> Path | None
             figure = _plot_step_response(plot, record, samples)
         elif task == "tracker-v0":
             figure = _plot_tracker_response(plot, samples)
-        elif task == "target-waypoints":
+        elif task in {"target-waypoints", "target-trajectory"}:
             figure = _plot_target_response(plot, samples)
         elif task in {"measure-hover", "takeoff-hover-land", "hold"}:
             figure = _plot_single_vehicle_response(plot, record, samples)
         else:
             return None
+        output_dir.mkdir(parents=True, exist_ok=True)
         path = output_dir / "response.png"
         figure.savefig(path, dpi=150, bbox_inches="tight")
+        if picture_dir is not None:
+            picture_dir.mkdir(parents=True, exist_ok=True)
+            figure.savefig(picture_dir / f"{output_dir.name}.png", dpi=150, bbox_inches="tight")
         plot.close(figure)
         return path
     except Exception:
@@ -79,9 +93,33 @@ def _plot_step_response(plot: Any, record: dict[str, Any], samples: list[dict[st
 
 def _plot_tracker_response(plot: Any, samples: list[dict[str, float]]) -> Any:
     time = _time(samples)
-    figure, axes = plot.subplots(2, 2, figsize=(12, 8), sharex=True)
+    figure, axes = plot.subplots(3, 2, figsize=(12, 12))
+    plan_axis = axes[0, 0]
+    plan_axis.plot(
+        [sample["target_e"] for sample in samples],
+        [sample["target_n"] for sample in samples],
+        label="target truth",
+    )
+    plan_axis.plot(
+        [sample["desired_e"] for sample in samples],
+        [sample["desired_n"] for sample in samples],
+        linestyle="--",
+        label="desired tracker",
+    )
+    plan_axis.plot(
+        [sample["tracker_e"] for sample in samples],
+        [sample["tracker_n"] for sample in samples],
+        label="tracker actual",
+    )
+    plan_axis.set_title("shared ENU horizontal trajectory")
+    plan_axis.set_xlabel("east [m]")
+    plan_axis.set_ylabel("north [m]")
+    plan_axis.set_aspect("equal", adjustable="box")
+    plan_axis.grid(True, alpha=0.3)
+    plan_axis.legend(loc="best")
+    axes[0, 1].axis("off")
     labels = (("east", "e"), ("north", "n"), ("up", "u"))
-    for axis, (label, key) in zip(axes.flat[:3], labels):
+    for axis, (label, key) in zip((axes[1, 0], axes[1, 1], axes[2, 0]), labels):
         axis.plot(time, [sample[f"target_{key}"] for sample in samples], label="target")
         axis.plot(time, [sample[f"desired_{key}"] for sample in samples], label="desired tracker")
         axis.plot(time, [sample[f"tracker_{key}"] for sample in samples], label="tracker")
@@ -89,36 +127,55 @@ def _plot_tracker_response(plot: Any, samples: list[dict[str, float]]) -> Any:
         axis.set_ylabel("position [m]")
         axis.grid(True, alpha=0.3)
         axis.legend(loc="best")
-    error_axis = axes.flat[3]
+    error_axis = axes[2, 1]
     error_axis.plot(time, [sample["error"] for sample in samples], label="tracking error")
     error_axis.plot(time, [sample["measurement_error"] for sample in samples], label="measurement error")
     error_axis.set_title("tracking error")
     error_axis.set_ylabel("error [m]")
     error_axis.grid(True, alpha=0.3)
     error_axis.legend(loc="best")
-    for axis in axes[1]:
+    for axis in (axes[1, 0], axes[1, 1], axes[2, 0], axes[2, 1]):
         axis.set_xlabel("time [s]")
     return figure
 
 
 def _plot_target_response(plot: Any, samples: list[dict[str, float]]) -> Any:
     time = _time(samples)
-    figure, axes = plot.subplots(2, 2, figsize=(12, 8), sharex=True)
+    figure, axes = plot.subplots(3, 2, figsize=(12, 12))
+    plan_axis = axes[0, 0]
+    plan_axis.plot(
+        [sample["reference_e"] for sample in samples],
+        [sample["reference_n"] for sample in samples],
+        linestyle="--",
+        label="reference",
+    )
+    plan_axis.plot(
+        [sample["actual_e"] for sample in samples],
+        [sample["actual_n"] for sample in samples],
+        label="target actual",
+    )
+    plan_axis.set_title("target local ENU horizontal trajectory")
+    plan_axis.set_xlabel("east [m]")
+    plan_axis.set_ylabel("north [m]")
+    plan_axis.set_aspect("equal", adjustable="box")
+    plan_axis.grid(True, alpha=0.3)
+    plan_axis.legend(loc="best")
+    axes[0, 1].axis("off")
     labels = (("east", "e"), ("north", "n"), ("up", "u"))
-    for axis, (label, key) in zip(axes.flat[:3], labels):
+    for axis, (label, key) in zip((axes[1, 0], axes[1, 1], axes[2, 0]), labels):
         axis.plot(time, [sample[f"actual_{key}"] for sample in samples], label="target")
         axis.plot(time, [sample[f"reference_{key}"] for sample in samples], label="reference")
         axis.set_title(f"local {label}")
         axis.set_ylabel("position [m]")
         axis.grid(True, alpha=0.3)
         axis.legend(loc="best")
-    error_axis = axes.flat[3]
+    error_axis = axes[2, 1]
     error_axis.plot(time, [sample["error"] for sample in samples], label="waypoint error")
     error_axis.set_title("waypoint error")
     error_axis.set_ylabel("error [m]")
     error_axis.grid(True, alpha=0.3)
     error_axis.legend(loc="best")
-    for axis in axes[1]:
+    for axis in (axes[1, 0], axes[1, 1], axes[2, 0], axes[2, 1]):
         axis.set_xlabel("time [s]")
     return figure
 

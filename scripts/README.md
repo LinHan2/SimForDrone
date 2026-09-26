@@ -9,6 +9,7 @@
 | `run_target_waypoints.sh` | 独占 `14540`，控制 target 并发布共享状态 |
 | `run_tracker.sh` | 独占 `14541`，订阅 target 状态并控制 tracker |
 | `run_px4ctrl.sh` | `px4ctrl` 的单机控制、站位保持与标定入口 |
-| `check_*.sh`、`capture_*.sh`、`show_latest_tracking_result.sh` | 只读验证、采样与结果查看，详见测试脚本文档 |
+| `check_observation.sh [--rgbd]` | 只读 ROS 2 话题验收；`--rgbd` 额外采样并检查前视图像 |
+| `show_latest_tracking_result.sh` | 汇总最新 tracker 运行结果 |
 
 `scripts/env/` 下的三个环境 profile 只能通过 `source` 加载，不能直接执行。

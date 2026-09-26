@@ -76,7 +76,7 @@ class ResponsePlotTest(unittest.TestCase):
 
     def test_target_plot_is_written(self) -> None:
         record = {
-            "task": "target-waypoints",
+            "task": "target-trajectory",
             "samples": [
                 {
                     "t": 0.0,
@@ -115,10 +115,15 @@ class ResponsePlotTest(unittest.TestCase):
 
     def _assert_plot(self, record: dict) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = write_response_plot(Path(directory), record)
+            output_dir = Path(directory) / "tracking-run"
+            picture_dir = Path(directory) / "picture"
+            path = write_response_plot(output_dir, record, picture_dir=picture_dir)
             self.assertIsNotNone(path)
             self.assertTrue(path.is_file())
             self.assertGreater(path.stat().st_size, 0)
+            picture_path = picture_dir / "tracking-run.png"
+            self.assertTrue(picture_path.is_file())
+            self.assertGreater(picture_path.stat().st_size, 0)
 
 
 if __name__ == "__main__":

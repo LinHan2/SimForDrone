@@ -55,7 +55,7 @@ SimForDrone/
 
 ```bash
 cd /data/disk2/home/hl/research/SimForDrone
-./scripts/check_dual_uav_observation.sh
+./scripts/check_observation.sh
 ```
 
 预期有两台 PX4（`vehicle_id=0,1`）及以下 ROS 2 主题：目标机/跟踪机位姿，跟踪机前视 RGB、相机内参和深度图。详见 [运行手册](READMELIST/runbook.md)。

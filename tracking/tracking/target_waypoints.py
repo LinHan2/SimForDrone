@@ -16,11 +16,11 @@ from px4ctrl.fsm import PX4CtrlFSM, State
 from px4ctrl.inputs import CommandData
 from px4ctrl.link import MavlinkLink
 from px4ctrl.params import load_params
-from px4ctrl.plotting import write_response_plot
+from px4ctrl.plotting import PICTURE_DIR, write_response_plot
 from px4ctrl.vehicle import resolve_role
 from tracking.guidance import TargetState, Vector3
 from tracking.state_io import DEFAULT_STATE_HOST, DEFAULT_STATE_PORT, TargetStatePublisher
-from tracking.trajectory import WaypointSegment
+from tracking.trajectory import TrajectoryCycle, WaypointSegment
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = ROOT / "px4ctrl" / "config" / "sim.yaml"
@@ -33,6 +33,19 @@ def parse_args() -> argparse.Namespace:
     mode.add_argument("--execute", action="store_false", dest="probe", help="兼容旧命令；现在默认直接执行")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--interactive", action="store_true", help="起飞后从终端非阻塞读取手动航点")
+    parser.add_argument(
+        "--trajectory",
+        choices=("circle", "figure8", "helix"),
+        help="执行闭合动态轨迹；不能与 --interactive/--point 同时使用",
+    )
+    parser.add_argument("--trajectory-cycles", type=int, default=1, help="闭合轨迹执行周期数")
+    parser.add_argument("--trajectory-radius", type=float, default=1.0, help="闭合轨迹水平半径（m）")
+    parser.add_argument(
+        "--trajectory-vertical-amplitude",
+        type=float,
+        default=0.0,
+        help="螺旋轨迹的垂向振幅（m）；circle/figure8 忽略该值",
+    )
     parser.add_argument(
         "--point",
         action="append",
@@ -120,6 +133,19 @@ def reference_from_segment(
     if segment is None:
         return fallback, (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)
     return segment.sample(now - segment_started)
+
+
+def reference_from_trajectory(
+    trajectory: TrajectoryCycle, origin: Vector3, elapsed: float
+) -> tuple[Vector3, Vector3, Vector3]:
+    """将相对闭合轨迹转换为 target 本机 local ENU 的控制参考。"""
+
+    offset, velocity, acceleration = trajectory.sample(elapsed)
+    return (
+        tuple(origin[index] + offset[index] for index in range(3)),
+        velocity,
+        acceleration,
+    )
 
 
 def run_interactive(
@@ -255,14 +281,21 @@ def main() -> int:
         raise ValueError("start-delay/dwell/final-hold 必须非负，probe-seconds/tolerance 必须为正")
     if args.max_speed <= 0.0 or args.max_accel <= 0.0:
         raise ValueError("max-speed 与 max-accel 必须为正")
+    if args.trajectory is not None and (args.interactive or args.point):
+        raise ValueError("--trajectory 不能与 --interactive 或 --point 同时使用")
+    if args.trajectory_cycles <= 0 or args.trajectory_radius <= 0.0:
+        raise ValueError("trajectory-cycles 与 trajectory-radius 必须为正")
+    if args.trajectory_vertical_amplitude < 0.0:
+        raise ValueError("trajectory-vertical-amplitude 不得为负")
     points = args.point or [(0.0, 0.0, 2.0), (2.0, 0.0, 2.0), (0.0, 0.0, 2.0)]
     params = load_params(args.config)
     defaults = task_defaults(params)
     link = MavlinkLink(params.link, resolve_role("target"), shared_frame=params.shared_frame)
     fsm = PX4CtrlFSM(params, LinearControl(params), link, log=lambda message: print(f"[target] {message}"))
     publisher = TargetStatePublisher(args.state_host, args.state_port)
-    output_dir = args.output_root / f"target-waypoints-{time.strftime('%Y%m%d-%H%M%S')}"
-    record: dict[str, object] = {"task": "target-waypoints", "points": points, "execute": not args.probe}
+    task_name = "target-trajectory" if args.trajectory is not None else "target-waypoints"
+    output_dir = args.output_root / f"{task_name}-{time.strftime('%Y%m%d-%H%M%S')}"
+    record: dict[str, object] = {"task": task_name, "points": points, "execute": not args.probe}
     samples: list[dict[str, float]] = []
 
     try:
@@ -310,6 +343,68 @@ def main() -> int:
             samples = run_interactive(
                 link, fsm, publisher, home, rate, args.tolerance, args.max_speed, args.max_accel
             )
+        elif args.trajectory is not None:
+            trajectory = TrajectoryCycle(
+                pattern=args.trajectory,
+                radius=args.trajectory_radius,
+                vertical_amplitude=args.trajectory_vertical_amplitude,
+                max_speed=args.max_speed,
+                max_accel=args.max_accel,
+            )
+            record["trajectory"] = {
+                "pattern": args.trajectory,
+                "cycles": args.trajectory_cycles,
+                "radius_m": args.trajectory_radius,
+                "vertical_amplitude_m": args.trajectory_vertical_amplitude,
+                "cycle_duration_s": trajectory.duration,
+            }
+            # 起点取实测悬停位置。每周期的首末参考及其一、二阶导数均为零，故周期
+            # 拼接不会引入位置、速度或加速度跳变。
+            origin = link.odom.p
+            fsm.request_command_control()
+            started = time.monotonic()
+            total_duration = trajectory.duration * args.trajectory_cycles
+            next_status = started
+            print(
+                f"target 动态轨迹：{args.trajectory}，{args.trajectory_cycles} 周期，"
+                f"单周期 {trajectory.duration:.2f}s，v≤{args.max_speed:.2f} m/s，"
+                f"a≤{args.max_accel:.2f} m/s²"
+            )
+            while time.monotonic() - started < total_duration:
+                now = time.monotonic()
+                elapsed = now - started
+                cycle_elapsed = elapsed % trajectory.duration
+                reference_p, reference_v, reference_a = reference_from_trajectory(
+                    trajectory, origin, cycle_elapsed
+                )
+                fsm.set_command(CommandData(p=reference_p, v=reference_v, a=reference_a, yaw=0.0))
+                fsm.process(now)
+                publish_state(link, publisher, now)
+                error = math.dist(link.odom.p, reference_p)
+                samples.append(
+                    {
+                        "t": now,
+                        "waypoint": 0.0,
+                        "error": error,
+                        "actual_e": link.odom.p[0],
+                        "actual_n": link.odom.p[1],
+                        "actual_u": link.odom.p[2],
+                        "reference_e": reference_p[0],
+                        "reference_n": reference_p[1],
+                        "reference_u": reference_p[2],
+                        "tilt_saturated": float(fsm.controller.debug.tilt_saturated),
+                    }
+                )
+                if now >= next_status:
+                    print(
+                        f"[target-trajectory] t={elapsed:5.1f}s "
+                        f"shared=({link.shared_position[0]:+.2f},{link.shared_position[1]:+.2f},"
+                        f"{link.shared_position[2]:+.2f}) ref_local=({reference_p[0]:+.2f},"
+                        f"{reference_p[1]:+.2f},{reference_p[2]:+.2f}) err={error:.3f}m",
+                        flush=True,
+                    )
+                    next_status = now + 1.0
+                time.sleep(rate)
         else:
             # 只需在首个航段前切一次指令控制状态。
             command_mode_requested = False
@@ -388,6 +483,12 @@ def main() -> int:
                 time.sleep(rate)
 
         record["samples"] = samples[:: max(1, len(samples) // 300)]
+        if samples:
+            record["reference_error_mean_m"] = sum(sample["error"] for sample in samples) / len(samples)
+            record["reference_error_max_m"] = max(sample["error"] for sample in samples)
+            record["tilt_saturated_samples"] = sum(
+                int(sample.get("tilt_saturated", 0.0)) for sample in samples
+            )
         record.update(finish(link, fsm, defaults.landing_timeout, print, defaults.disarm_timeout))
         passed = bool(record.get("on_ground")) and bool(record.get("disarmed"))
         record["passed"] = passed
@@ -412,13 +513,14 @@ def main() -> int:
             record["samples"] = samples[:: max(1, len(samples) // 300)]
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "run.json").write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        plot_path = write_response_plot(output_dir, record)
+        plot_path = write_response_plot(output_dir, record, picture_dir=PICTURE_DIR)
         if plot_path is not None:
             record["response_plot"] = plot_path.name
+            record["picture_plot"] = str(PICTURE_DIR / f"{output_dir.name}.png")
             (output_dir / "run.json").write_text(
                 json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
             )
-            print(f"PLOT: {plot_path}")
+            print(f"PLOT: {plot_path}；归档: {record['picture_plot']}")
         publisher.close()
         link.close()
         print(f"LOG: {output_dir}")

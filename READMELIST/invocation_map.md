@@ -68,7 +68,6 @@ graph TD
     subgraph ALGO["算法层"]
         T1["tracking.run_tracker（终端 2）"]
         T2["tracking.target_waypoints（终端 1）"]
-        T3["tracking.run_static（单进程，旧；shell 包装已删）"]
         T4["tracking.guidance"]
         T5["tracking.trajectory"]
         T6["tracking.estimation"]
@@ -79,11 +78,8 @@ graph TD
         T2 --> T4
         T2 --> T5
         T2 --> T7
-        T3 --> T4
-        T3 --> T6
         T1 -->|复用生命周期函数| C1
         T2 -->|复用生命周期函数| C1
-        T3 -->|仅 wait_ready| C1
     end
 
     UDP["UDP 127.0.0.1:14600<br/>共享 ENU 目标状态"]
@@ -157,29 +153,11 @@ graph TD
               └─ px4ctrl.link.send_attitude_thrust()               → 14541
 ```
 
-### 3.2 单进程双机（早期形态，`run_static.py`）
-
-一个进程内同时开两个 `MavlinkLink`（14540 + 14541）控制两台机，只能跑固定脚本，
-无法手动输入航点，也不经过 UDP 状态转发（真值在进程内直接共享）。**shell 包装
-`scripts/run_tracking.sh` 已删除**，模块保留，需要时直接调用：
+### 3.2 只读验收（不发任何控制指令）
 
 ```bash
-export SIMFORDRONE_ROOT=/data/disk2/home/hl/research/SimForDrone
-source scripts/env/activate_px4_mavlink_control.sh
-PYTHONPATH=tracking:px4ctrl "${SIMFORDRONE_PX4_PYTHON}" -m tracking.run_static --execute
-```
-
-它对起飞与降落有自己的双机实现（`enter_offboard_both` / `land_both`），
-只从 `px4ctrl.cli` 借用 `wait_ready`。
-
-> 已被 3.1 取代；模块保留为最小的端到端回归用例，排查“是不是多进程引入的问题”时可用。
-
-### 3.3 只读验收（不发任何控制指令）
-
-```bash
-./scripts/check_dual_uav_observation.sh   # source 系统 ROS，检查话题是否齐全
-./scripts/capture_rgbd_sample.sh          # 采一组 RGB-D 到 logs/rgbd_samples/
-./scripts/check_observer_rgb_scene.sh     # 检查画面可读性
+./scripts/check_observation.sh            # source 系统 ROS，检查话题是否齐全
+./scripts/check_observation.sh --rgbd     # 额外采样 RGB-D 并检查画面可读性
 ./scripts/show_latest_tracking_result.sh  # 汇总 logs/tracking/ 最新结果
 ```
 
@@ -197,7 +175,7 @@ PYTHONPATH=tracking:px4ctrl "${SIMFORDRONE_PX4_PYTHON}" -m tracking.run_static -
 |---|---|---|---|
 | `scripts/env/activate_isaacsim_internal_ros.sh` | 场景脚本的**子 shell** | Isaac 自带 Python 3.11 + 内置 Jazzy | `LD_LIBRARY_PATH` 只指向 Isaac 的 Jazzy，拼上 `/opt/ros/jazzy/lib` 会段错误；还会 `unset DISPLAY/XAUTHORITY` 以强制无头 |
 | `scripts/env/activate_px4_mavlink_control.sh` | `scripts/run_px4ctrl.sh`、`scripts/run_*.sh` | `PX4-Autopilot/.venv/bin/python`（有 pymavlink，**无 rclpy**） | `unset PYTHONPATH/CONDA_*/LD_LIBRARY_PATH`，把 Conda 挡在外面 |
-| `scripts/env/activate_system_ros2_jazzy.sh` | `scripts/check_*.sh`、`scripts/capture_*.sh` | `/usr/bin/python3` + `/opt/ros/jazzy`（有 rclpy，**无 pymavlink**） | 只读验收专用 |
+| `scripts/env/activate_system_ros2_jazzy.sh` | `scripts/check_observation.sh` | `/usr/bin/python3` + `/opt/ros/jazzy`（有 rclpy，**无 pymavlink**） | 只读验收专用 |
 
 **不要在同一终端里混用。** 典型症状：控制脚本里 `import rclpy` 失败（本来就不该有），
 或场景启动时报 `librmw` 符号错误（系统 ROS 被带进去了）。
