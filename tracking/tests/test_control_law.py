@@ -10,7 +10,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from px4ctrl.controller import DesiredState, LinearControl
-from px4ctrl.fsm import PX4CtrlFSM, State, TILT_SATURATION_HOVER_DELAY_S
+from px4ctrl.fsm import PX4CtrlFSM, State
 from px4ctrl.inputs import CommandData, ImuData, OdomData, quaternion_from_yaw
 from px4ctrl.params import load_params
 
@@ -87,10 +87,10 @@ class ControlLawTest(unittest.TestCase):
 
         cases = ((0.3, 0.0, 0.8), (0.3, -0.4, -0.5), (0.6, 0.6, 0.2))
         for yaw in (0.0, math.pi / 2.0):
-            odom = OdomData(recv_time=1.0, q=quaternion_from_yaw(yaw))
+            odom = OdomData(recv_time=1.0, q=quaternion_from_yaw(yaw + 0.4))
             for desired_p in cases:
                 self.controller.calculate_control(
-                    DesiredState(p=desired_p), odom, ImuData(), now=1.0
+                    DesiredState(p=desired_p, yaw=yaw), odom, ImuData(), now=1.0
                 )
 
                 des_a = self.controller.debug.des_a
@@ -114,6 +114,18 @@ class ControlLawTest(unittest.TestCase):
                 norm = math.sqrt(sum(component * component for component in des_a))
                 for computed, expected in zip(direction, des_a):
                     self.assertAlmostEqual(computed, expected / norm, places=9)
+
+    def test_combined_tilt_is_bounded(self) -> None:
+        params = replace(self.params, max_angle=20.0)
+        controller = LinearControl(params)
+        controller.calculate_control(
+            DesiredState(p=(3.0, 3.0, 0.0), yaw=math.pi / 3),
+            self.odom, ImuData(), now=1.0,
+        )
+        roll, pitch = controller.debug.roll, controller.debug.pitch
+        combined_tilt = math.acos(math.cos(roll) * math.cos(pitch))
+        self.assertTrue(controller.debug.tilt_saturated)
+        self.assertLessEqual(combined_tilt, math.radians(20.0) + 1e-12)
 
     def test_thrust_compensates_tilt(self) -> None:
         output = self.controller.calculate_control(
@@ -282,7 +294,7 @@ class CommandFreshnessTest(unittest.TestCase):
 
         self.assertEqual(self.fsm.state, State.AUTO_HOVER)
 
-    def test_short_tilt_saturation_does_not_trip_watchdog(self) -> None:
+    def test_short_tilt_saturation_keeps_command_control(self) -> None:
         self.fsm.set_command(CommandData(p=(10.0, 0.0, 0.0)), now=1000.0)
         self.fsm.request_command_control()
 
@@ -293,18 +305,18 @@ class CommandFreshnessTest(unittest.TestCase):
         self.assertTrue(self.fsm.controller.debug.tilt_saturated)
         self.assertEqual(self.fsm.state, State.CMD_CTRL)
 
-    def test_sustained_tilt_saturation_falls_back_to_hover(self) -> None:
+    def test_sustained_tilt_saturation_keeps_command_control(self) -> None:
+        # 与上游 px4ctrl 一致：持续限幅不回退悬停，只留下诊断标记。
         self.fsm.set_command(CommandData(p=(10.0, 0.0, 0.0)), now=1000.0)
         self.fsm.request_command_control()
 
-        self._advance(1000.0)
-        trip_time = 1000.0 + TILT_SATURATION_HOVER_DELAY_S
-        self.fsm.set_command(CommandData(p=(10.0, 0.0, 0.0)), now=trip_time)
-        self._advance(trip_time)
+        for step in (1000.1, 1000.2, 1000.3, 1000.4):
+            self._advance(step)
+            self.fsm.set_command(CommandData(p=(10.0, 0.0, 0.0)), now=step)
+        self._advance(1000.4)
 
-        self.assertEqual(self.fsm.state, State.AUTO_HOVER)
-        self.assertEqual(self.fsm.hover_pose, self.link.odom.p)
-        self.assertFalse(self.fsm.controller.debug.tilt_saturated)
+        self.assertEqual(self.fsm.state, State.CMD_CTRL)
+        self.assertTrue(self.fsm.controller.debug.tilt_saturated)
 
     def test_so3_mode_sends_bodyrate_setpoints(self) -> None:
         self.fsm.params = replace(self.params, use_bodyrate_ctrl=True)

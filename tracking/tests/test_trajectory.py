@@ -117,6 +117,11 @@ class TrajectoryCycleTest(unittest.TestCase):
             self.assertLessEqual(peak_speed, max_speed + 1e-6, pattern)
             self.assertLessEqual(peak_accel, max_accel + 1e-6, pattern)
 
+    def test_fast_circle_reference_exceeds_two_meters_per_second(self) -> None:
+        trajectory = TrajectoryCycle("circle", 3.0, 0.0, 2.2, 2.5)
+        _, velocity, _ = trajectory.sample(trajectory.duration / 2)
+        self.assertGreater(math.dist((0.0, 0.0, 0.0), velocity), 2.0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -48,7 +48,7 @@ graph TD
         S0["scripts/start_dual_px4_scene.sh"]
         S1["scripts/01_dual_px4_scene.py"]
         S2["simfordrone.dual_uav_observation<br/>DualUavObservationApp"]
-        S3["industrial_hangar / pegasus_compat / vehicle_monitor / view_control"]
+        S3["industrial_hangar（环境 USD）/ lighting（光照）/ pegasus_compat / vehicle_monitor / view_control"]
         S0 -->|source E1 后 exec| S1 --> S2
         S2 --> S3
     end
@@ -120,7 +120,8 @@ graph TD
               └─ SimulationApp(headless, hide_ui=False) + enable_extension(ros2.bridge, livestream.nvcf)
                  └─ sys.path += src/ 与 PegasusSimulator/extensions/pegasus.simulator
                     └─ DualUavObservationApp(simulation_app).run()
-                       ├─ industrial_hangar.py       加载 USD 环境
+                       ├─ industrial_hangar.py       加载 USD 环境（空场景即报错）
+                       ├─ lighting.py                建立环境光/太阳光/室内补光
                        ├─ pegasus_compat.py          为 Isaac 5.1 打补丁（如深度图 ROS 标记）
                        ├─ Pegasus 启动 instance 0/1 → PX4 SITL instance 0/1
                        │     └─ PX4 侧: 14540 → instance 0 (sysid 1) / 14541 → instance 1 (sysid 2)
@@ -136,7 +137,7 @@ graph TD
               ├─ px4ctrl.cli.wait_ready / enter_offboard          ← 复用执行层的生命周期
               ├─ px4ctrl.fsm.PX4CtrlFSM + px4ctrl.controller.LinearControl
               ├─ tracking.trajectory.WaypointSegment.sample()      → 位置/速度前馈
-              ├─ tracking.state_io.TargetStatePublisher.publish()  → UDP 14600
+              ├─ tracking.state_io.TargetStatePublisher.publish()  → UDP 14600（共享 ENU p/v + PX4 EKF 姿态 q）
               └─ px4ctrl.cli.finish() → 降落 → 上锁
 
 终端 2  ./scripts/run_tracker.sh
@@ -146,6 +147,8 @@ graph TD
               ├─ tracking.state_io.TargetStateSubscriber.poll()    ← UDP 14600，非阻塞
               ├─ tracking.estimation.select_target_state(source=truth|estimator)
               │     └─ NoisyTargetSensor / PassthroughEstimator
+              ├─ source=relative-ekf 时：RelativeEkfTargetEstimator
+              │     └─ target 位置量测 + target 姿态 + tracker IMU 比力 → 估计 p/v/a
               ├─ tracking.guidance.PositionTrackerV0.compute()     → DesiredState
               ├─ px4ctrl.inputs.CommandData（带 recv_time）
               ├─ px4ctrl.fsm.PX4CtrlFSM
@@ -188,7 +191,7 @@ graph TD
 |---|---|---|---|---|
 | MAVLink | UDP `14540` | PX4(instance 0) ↔ target 进程 | 心跳、`SET_ATTITUDE_TARGET`、遥测 | `px4ctrl/vehicle.py` `_ROLES` |
 | MAVLink | UDP `14541` | PX4(instance 1) ↔ tracker 进程 | 同上 | 同上 |
-| 共享目标状态 | UDP `127.0.0.1:14600` | target 进程 → tracker 进程 | `StampedTargetState`(JSON) | `tracking/state_io.py` |
+| 共享目标状态 | UDP `127.0.0.1:14600` | target 进程 → tracker 进程 | `StampedTargetState`(共享 ENU p/v、ENU/FLU q；JSON) | `tracking/state_io.py` |
 | ROS 2 位姿 | `/target_uav_0/state/pose`、`/tracker_uav_1/state/pose` | 场景 → 任何订阅者 | Pegasus 真值位姿 | `vehicle.py` `pose_topic` |
 | ROS 2 相机 | `/<ns><id>/...` RGB/Depth/CameraInfo | 场景 → 订阅者 | 图像与内参 | `pegasus_compat.py` 补深度标记 |
 | WebRTC | `10.134.88.113:49100` | 场景 → 浏览器 | 画面 + 合成 UI | `start_dual_px4_scene.sh` |

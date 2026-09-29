@@ -288,7 +288,11 @@ def enter_offboard(link: MavlinkLink, fsm: PX4CtrlFSM, log: Callable[[str], None
             log("OFFBOARD 已确认")
             return
         time.sleep(0.01)
-    raise RuntimeError("切换后未在 HEARTBEAT 中观测到 Offboard 主模式；PX4 可能已回落")
+    raise RuntimeError(
+        "切换后未在 HEARTBEAT 中观测到 Offboard 主模式；"
+        f"当前主模式={(link.state.custom_mode >> 16) & 0xFF}，"
+        f"armed={link.state.armed}，PX4 状态={link.last_statustext!r}"
+    )
 
 
 def finish(
@@ -349,9 +353,9 @@ def finish(
             break
         time.sleep(0.02)
 
-    # 第二级：仍未上锁则强制上锁（PX4 魔术参数 21196）。宁可多一次带强制的尝试，
-    # 也不要让飞机停在"已落地但保持解锁"的状态、把收尾交给飞控 failsafe。
-    if link.state.armed:
+    # 第二级只允许在已确认落地后强制上锁。飞行中强制上锁会直接切断推力，
+    # 即使 LAND 已被接受也不能把未落地的飞行器当作可安全上锁的对象。
+    if link.state.armed and result["on_ground"]:
         log("常规上锁未生效，尝试强制上锁")
         attempt = {"force": True, "accepted": False, "error": None}
         try:
@@ -362,6 +366,8 @@ def finish(
             attempt["error"] = str(error)
             log(f"WARN: 强制上锁失败: {error}")
         result["disarm_attempts"].append(attempt)
+    elif link.state.armed:
+        log("WARN: 未确认落地，跳过强制上锁")
 
     deadline = time.monotonic() + disarm_timeout
     while time.monotonic() < deadline:
@@ -594,7 +600,8 @@ def run_step_response(
     """执行单轴位置阶跃并记录可重复的闭环响应。
 
     阶跃在起飞并稳定悬停后才施加，前置等待阶段用于分离起飞交接瞬态。测试期间仍逐周期
-    刷新 ``CMD_CTRL``，保留既有倾角饱和回退；触发回退时停止评估响应但仍走正常降落收尾。
+    刷新 ``CMD_CTRL``；倾角饱和只记录不中断（与上游 px4ctrl 一致），若因指令超时等
+    其它原因触发保护性降级，则停止评估响应但仍走正常降落收尾。
     """
 
     axis_index = {"east": 0, "north": 1, "up": 2}[args.step_axis]

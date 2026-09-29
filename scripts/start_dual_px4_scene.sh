@@ -21,6 +21,7 @@ ETLI_GUARD_INTERVAL="${ISAAC_ETLI_GUARD_INTERVAL:-30}"
 PUBLIC_ENDPOINT="${ISAAC_PUBLIC_ENDPOINT:-10.134.88.113}"
 STREAM_PORT="${ISAAC_STREAM_PORT:-49100}"
 PX4_INPUT_SCALING="${SIMFORDRONE_PX4_INPUT_SCALING:-2000}"
+PX4_SIM_BAT_DRAIN="${SIMFORDRONE_PX4_SIM_BAT_DRAIN:-3600}"
 ISAAC_GUI="${SIMFORDRONE_ISAAC_GUI:-0}"
 # carb 设置 /app/livestream/webrtcEtli 控制 WebRTC 跟踪记录；置 0 可关闭。
 WEBRTC_ETLI="${ISAAC_WEBRTC_ETLI:-0}"
@@ -31,6 +32,7 @@ WEBRTC_ETLI="${ISAAC_WEBRTC_ETLI:-0}"
 STREAM_UI="${SIMFORDRONE_ISAAC_STREAM_UI:-1}"
 # 带 UI 流的后端：base = 原应用仅解除隐藏（已验证可用）；full = 官方 streaming 应用。
 STREAM_BACKEND="${SIMFORDRONE_ISAAC_STREAM_BACKEND:-base}"
+INITIAL_VIEW="${SIMFORDRONE_INITIAL_VIEW:-free}"
 # 官方“无窗口 + UI 随流发送”应用；本地 GUI 与 base 后端都不加载它。
 STREAM_EXPERIENCE="${ISAACSIM_ROOT}/apps/isaacsim.exp.full.streaming.kit"
 
@@ -48,6 +50,8 @@ Usage: ./scripts/start_dual_px4_scene.sh [options]
                   (hideUi=false, verified working).
   --no-stream-ui  Stream the rendered image only. The scene then prints a 1 Hz
                   [vehicle-state] line in this terminal instead of drawing the HUD.
+    --onboard       Show the tracker's actual onboard camera in the WebRTC viewport
+                                    as soon as its camera prim is available (requires UI stream).
   --gui           Start the local Isaac Sim desktop interface. NOTE: the X display on this
                   machine is not accessible (Invalid MIT-MAGIC-COOKIE-1 key), so this
                   currently fails; use the stream modes instead.
@@ -84,9 +88,13 @@ case "${1:-}" in
     --stream-ui) STREAM_UI=1; STREAM_BACKEND="base" ;;
     --stream-ui-full) STREAM_UI=1; STREAM_BACKEND="full" ;;
     --no-stream-ui) STREAM_UI=0 ;;
+    --onboard) INITIAL_VIEW="onboard_tracker" ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; die "Unknown argument: $1" ;;
 esac
+if [[ "${INITIAL_VIEW}" == "onboard_tracker" && "${STREAM_UI}" != "1" && "${ISAAC_GUI}" != "1" ]]; then
+    die "Onboard viewport requires UI stream or GUI"
+fi
 
 # 本地桌面与带 UI 流都需要绘制 UI；纯画面流则不需要。
 if [[ "${ISAAC_GUI}" == "1" || "${STREAM_UI}" == "1" ]]; then
@@ -109,6 +117,7 @@ fi
     || die "Pegasus source extension not found"
 [[ -x "${SIMFORDRONE_ROOT}/PX4-Autopilot/build/px4_sitl_default/bin/px4" ]] \
     || die "PX4 SITL binary is missing; build PX4 before starting this scene"
+[[ "${PX4_SIM_BAT_DRAIN}" =~ ^[1-9][0-9]*$ ]] || die "SIMFORDRONE_PX4_SIM_BAT_DRAIN must be a positive integer (seconds)"
 
 mkdir -p "${LOG_DIR}" "${ETLI_DIR}"
 LOG_FILE="${LOG_DIR}/dual_px4_$(date +%Y%m%d-%H%M%S).log"
@@ -138,8 +147,10 @@ Starting Pegasus dual-PX4 scene
   PX4:       ${SIMFORDRONE_ROOT}/PX4-Autopilot
   ROS 2:     Jazzy internal rclpy + Fast DDS
   PX4 gain:  ${PX4_INPUT_SCALING}
+    PX4 simulated battery discharge: ${PX4_SIM_BAT_DRAIN}s
   Isaac UI:  $([[ "${ISAAC_UI}" == "1" ]] && echo "enabled (HUD; backend=${STREAM_BACKEND})" || echo "disabled (image only, terminal [vehicle-state] active)")
   View cmd:  0 free | 1 overview | 2 target | 3 tracker | 4 onboard | v status
+    Initial view: ${INITIAL_VIEW}
   WebRTC:    ${PUBLIC_ENDPOINT}:${STREAM_PORT}
   WebRTC trace (etli): ${WEBRTC_ETLI} -> ${ETLI_DIR}（单文件上限 ${ETLI_MAX_MB} MB）
   Log:       ${LOG_FILE}
@@ -176,7 +187,7 @@ trap stop_etli_guard EXIT INT TERM
 
 # 在子 shell 中加载 Isaac 专用环境，避免它反向污染用户当前 SSH 终端。
 (
-    export SIMFORDRONE_ROOT ISAACSIM_ROOT SIMFORDRONE_PX4_INPUT_SCALING="${PX4_INPUT_SCALING}" SIMFORDRONE_ISAAC_GUI="${ISAAC_GUI}" SIMFORDRONE_ISAAC_UI="${ISAAC_UI}" SIMFORDRONE_ISAAC_EXPERIENCE="${ISAAC_EXPERIENCE}"
+    export SIMFORDRONE_ROOT ISAACSIM_ROOT SIMFORDRONE_CONFIG SIMFORDRONE_PX4_INPUT_SCALING="${PX4_INPUT_SCALING}" SIMFORDRONE_ISAAC_GUI="${ISAAC_GUI}" SIMFORDRONE_ISAAC_UI="${ISAAC_UI}" SIMFORDRONE_ISAAC_EXPERIENCE="${ISAAC_EXPERIENCE}" SIMFORDRONE_INITIAL_VIEW="${INITIAL_VIEW}" PX4_PARAM_SIM_BAT_DRAIN="${PX4_SIM_BAT_DRAIN}"
     source "${ISAAC_ENV_SCRIPT}"
     # 切换到 logs/ 下的专用目录，使 .etli 不再落到仓库根。
     cd "${ETLI_DIR}"

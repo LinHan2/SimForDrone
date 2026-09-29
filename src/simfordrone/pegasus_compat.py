@@ -27,6 +27,19 @@ def enable_rgbd_ros2_depth_marker() -> None:
         # 却会阻止 ROS 2 writer 创建，尤其在 Warehouse 的 headless 首帧阶段明显。
         self.counter = max(getattr(self, "counter", 100), 100)
         data = upstream_update(self, *args, **kwargs)
+        # Pegasus 的原实现把相机状态构造包在裸 except 中。Isaac 5.1 的镜头 API
+        # 发生兼容性差异时，该异常会被静默折叠为 None，ROS writer 因而永远不会
+        # 注册。writer 只需要相机对象、名字和渲染产品；在相机已完成 start() 后
+        # 补齐这组稳定字段，不读取图像像素，也不替代上游的正常采样路径。
+        if data is None and getattr(self, "_camera_full_set", False):
+            data = {
+                "camera_name": self._camera_name,
+                "stage_prim_path": self._stage_prim_path,
+                "height": self._resolution[1],
+                "width": self._resolution[0],
+                "frequency": self._frequency,
+                "camera": self._camera,
+            }
         if isinstance(data, dict) and getattr(self, "_depth", False):
             data["depth"] = True
         return data

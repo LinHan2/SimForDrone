@@ -9,6 +9,8 @@ from __future__ import annotations
 import os
 import math
 import time
+import json
+from pathlib import Path
 
 import carb
 import omni.timeline
@@ -27,7 +29,9 @@ from pegasus.simulator.params import ROBOTS
 
 from simfordrone.config import load_dual_uav_config
 from simfordrone.industrial_hangar import IndustrialHangar
+from simfordrone.lighting import LightRig
 from simfordrone.pegasus_compat import enable_rgbd_ros2_depth_marker
+from simfordrone.view_control import FREE, ONBOARD_TRACKER
 
 
 # PX4 的 HIL_ACTUATOR_CONTROLS 是归一化控制量。Pegasus 将其转换为转子角速度时，
@@ -48,8 +52,20 @@ class DualUavObservationApp:
         self.rotor_input_scaling = float(os.environ.get("SIMFORDRONE_PX4_INPUT_SCALING", configured_scaling))
         if self.rotor_input_scaling <= 0.0:
             raise ValueError("PX4 rotor_input_scaling 必须为正数")
-        # 使用官方 Warehouse USD，而非由基础几何体拼出的伪机库背景。
-        IndustrialHangar(self.world.stage, self.world, self.config["environment"]).build()
+        # 环境与光照分开构建：前者决定“场景里有什么”，后者决定“怎么照亮它们”。
+        # 空网格场景既没有物体、光照也不足，无法支撑后续图像闭环。
+        environment = IndustrialHangar(
+            self.world.stage, self.world, self.config["environment"]
+        )
+        environment_label = environment.build()
+        light_paths = LightRig(self.world.stage, self.config["environment"]["lighting"]).build()
+        # 把“环境真的载入了多少物体、装了几盏灯”打进启动日志：
+        # 这是判断场景是否为空的最直接证据，无需依赖肉眼看视频流。
+        print(
+            f"[scene] 环境 {environment_label}: 载入 {environment.loaded_prim_count} 个 prim；"
+            f"光源 {len(light_paths)} 个 -> {', '.join(light_paths)}",
+            flush=True,
+        )
 
         enable_rgbd_ros2_depth_marker()
         # 角色 → 载具句柄注册表：GUI 监视窗与终端状态输出都按角色读取世界位姿，
@@ -72,18 +88,35 @@ class DualUavObservationApp:
         )
         self.vehicle_monitor = None
         self.view_control = None
+        self.camera_overlay = None
         if self.ui_enabled:
             # 相机扫描只为机载视角切换服务，非 UI 模式下不做：
-            # 否则会打印“target 未找到机载相机”，而 target 本来就没挂相机，产生误导。
+            # 否则会打印"target 未找到机载相机"，而 target 本来就没挂相机，产生误导。
             self._register_camera_paths()
             try:
                 from simfordrone.vehicle_monitor import VehicleHudWindow
-                from simfordrone.view_control import HELP_LINES, ViewControl
+                from simfordrone.view_control import FREE, HELP_LINES, ONBOARD_TRACKER, ViewControl
 
                 # 机载视角只对 tracker 存在（target 未挂相机），缺失时 ViewControl 会退回跟随视角。
                 tracker_camera = self.vehicles["tracker"].get("camera_prim_path")
+                self._onboard_requested = os.environ.get("SIMFORDRONE_INITIAL_VIEW") == ONBOARD_TRACKER
                 self.view_control = ViewControl(self.vehicles, onboard_camera_path=tracker_camera)
+                if self._onboard_requested and tracker_camera:
+                    self.view_control.set_mode(ONBOARD_TRACKER)
                 self.vehicle_monitor = VehicleHudWindow(self.vehicles, self.view_control)
+                
+                if not self._onboard_requested:
+                    try:
+                        from simfordrone.camera_overlay import CameraOverlayWindow
+
+                        cam_cfg = self.config["observer_camera"]
+                        self.camera_overlay = CameraOverlayWindow(
+                            image_width=cam_cfg["resolution"][0],
+                            image_height=cam_cfg["resolution"][1],
+                            fov_deg=cam_cfg["diagonal_fov_deg"],
+                        )
+                    except Exception as error:
+                        print(f"[ui] 模拟相机窗口不可用，保留双机 HUD：{error}", flush=True)
                 print("[ui] HUD 已叠加到视频流；视角控制可用：", flush=True)
                 for line in HELP_LINES:
                     print("  " + line, flush=True)
@@ -95,6 +128,7 @@ class DualUavObservationApp:
                 self.ui_enabled = False
                 self.view_control = None
                 self.vehicle_monitor = None
+                self.camera_overlay = None
         # headless 模式没有可交互面板，改用终端周期输出同样的两机状态，
         # 使 WebRTC 用户也能核对物体位置而不仅看到画面。
         self._next_console_status = time.monotonic()
@@ -105,6 +139,46 @@ class DualUavObservationApp:
         # 相机 prim 可能晚于场景构建才出现，因此保留一个低频重扫节流点。
         self._next_camera_scan = time.monotonic()
         self.stop_sim = False
+        self.restart_dir = Path(__file__).resolve().parents[2] / "logs" / "px4_restart" / str(os.getpid())
+        self.restart_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[px4-restart] 请求目录：{self.restart_dir}", flush=True)
+
+    def _handle_px4_restart(self) -> None:
+        request_file = self.restart_dir / "request.json"
+        if not request_file.exists():
+            return
+        response_file = self.restart_dir / "response.json"
+        request = None
+        try:
+            request = json.loads(request_file.read_text(encoding="utf-8"))
+            nonce = request["nonce"]
+            if not isinstance(nonce, str) or not nonce:
+                raise ValueError("无效请求标识")
+            backends = []
+            for role in ("target", "tracker"):
+                vehicle = self.vehicles[role]["vehicle"]
+                state = vehicle.state
+                home_z = self.config["vehicles"][role]["initial_position"][2]
+                if abs(float(state.position[2]) - float(home_z)) > 0.25 or math.sqrt(
+                    sum(float(value) ** 2 for value in state.linear_velocity)
+                ) > 0.2:
+                    raise RuntimeError(f"{role} 尚未静止在初始地面位置，拒绝重启")
+                backends.append(next(backend for backend in vehicle._backends if isinstance(backend, PX4MavlinkBackend)))
+            processes = [backend.px4_tool.px4_process for backend in backends]
+            for backend in backends:
+                backend.stop()
+            for process in processes:
+                if process is not None:
+                    process.wait(timeout=5)
+            for backend in backends:
+                backend.start()
+            result = {"nonce": nonce, "ok": True, "message": "双 PX4 backend 已重新启动；等待健康检查恢复"}
+        except Exception as error:
+            result = {"nonce": request.get("nonce") if isinstance(request, dict) else None,
+                      "ok": False, "message": str(error)}
+        response_file.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+        request_file.unlink(missing_ok=True)
+        print(f"[px4-restart] {result['message']}", flush=True)
 
     def _create_vehicle(
         self,
@@ -131,7 +205,18 @@ class DualUavObservationApp:
         ros2 = {
             "namespace": ros_namespace,
             "pub_state": True,
-            "pub_sensors": False,
+            # PoseStamped 提供 ENU 位姿/姿态，state/accel 提供世界 ENU 加速度；IMU
+            # 保留 Pegasus 的原始 NED/FRD 比力，供 ROS 感知进程完成独立的时间对齐与转换。
+            "pub_pose": True,
+            "pub_accel": True,
+            "pub_sensors": True,
+            "pub_imu": True,
+            # Pegasus 的 ROS2Backend 会向后端分发每一种仿真传感器数据；当前上游实现
+            # 对单项发布器关闭没有保护，因此传感器总开关打开时必须同时创建 IMU、磁力计
+            # 和 GPS 发布器，避免每帧访问缺失属性而中断图形相机更新。
+            "pub_mag": True,
+            "pub_gps": True,
+            "pub_gps_vel": True,
             "pub_graphical_sensors": attach_camera,
             # 暂不发布 TF：Isaac 内部 rclpy 与系统 tf2 Python 不能混用。
             # 后续由项目适配层统一发布机体/相机变换，保证坐标约定可审计。
@@ -210,6 +295,7 @@ class DualUavObservationApp:
             self.world.step(render=True)
             # 视角必须在每个仿真步重新应用：跟随模式要求相机连续跟随载具运动。
             now = time.monotonic()
+            self._handle_px4_restart()
             if self.view_control is not None:
                 self.view_control.apply()
                 # 命令轮询单独节流到 10 Hz：stdin 读取无需跟随帧率。
@@ -224,12 +310,49 @@ class DualUavObservationApp:
                     self.view_control.set_onboard_camera_path(
                         self.vehicles["tracker"].get("camera_prim_path")
                     )
+                    if (self._onboard_requested and self.view_control.mode == FREE
+                            and self.vehicles["tracker"].get("camera_prim_path")):
+                        self.view_control.set_mode(ONBOARD_TRACKER)
+                        self._onboard_requested = False
                     self._next_camera_scan = now + 2.0
             # HUD 读取的是 Pegasus 自己维护的 vehicle.state（Isaac 世界系 ENU），
             # 不引入第二套位姿来源，避免与飞控 EKF 估计混淆。
             if self.vehicle_monitor is not None and now >= self._next_monitor_update:
                 self.vehicle_monitor.update()
                 self._next_monitor_update = now + 0.1
+            
+            # 更新相机叠加层：显示目标在图像中的位置
+            if self.camera_overlay is not None:
+                target_state = self.vehicles["target"]["vehicle"].state
+                tracker_state = self.vehicles["tracker"]["vehicle"].state
+                
+                # 计算相对位置（世界系 ENU）
+                rel_pos = (
+                    float(target_state.position[0] - tracker_state.position[0]),
+                    float(target_state.position[1] - tracker_state.position[1]),
+                    float(target_state.position[2] - tracker_state.position[2]),
+                )
+                
+                # 获取 tracker 偏航角
+                # Pegasus state.attitude 是四元数 [w, x, y, z]
+                q = tracker_state.attitude
+                tracker_yaw = math.atan2(
+                    2.0 * (float(q[0]) * float(q[3]) + float(q[1]) * float(q[2])),
+                    1.0 - 2.0 * (float(q[2])**2 + float(q[3])**2)
+                )
+                
+                # 更新相机视角投影
+                self.camera_overlay.update_from_relative_state(rel_pos, tracker_yaw)
+                
+                # TODO: 从控制器获取实际的 Barrier Lyapunov 控制状态
+                # 目前先用占位值，后续需要从 ROS2 话题订阅或控制器直接回传
+                self.camera_overlay.update_control_status(
+                    z1_normalized=0.0,  # 占位
+                    yaw_rate_cmd=0.0,   # 占位
+                    in_deadzone=True,   # 占位
+                )
+                self.camera_overlay.render()
+            
             # 终端状态按 1 Hz 节流输出：物理步进频率远高于此，逐帧打印会淹没日志。
             if self.console_state and now >= self._next_console_status:
                 # 除两机位置外还给出速度模长与两机间距：跟踪实验首先关心的就是

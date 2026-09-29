@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from px4ctrl.plotting import write_response_plot
+from px4ctrl.plotting import _plot_target_response, _plot_tracker_response, _target_samples, write_response_plot, write_tracker_estimation_plots
 
 
 class ResponsePlotTest(unittest.TestCase):
@@ -37,6 +37,45 @@ class ResponsePlotTest(unittest.TestCase):
             ],
         }
         self._assert_plot(record)
+
+    def test_target_speed_plot_contains_actual_and_reference(self) -> None:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plot
+
+        samples = [
+            {"t": timestamp, "actual_e": 0.0, "actual_n": 0.0, "actual_u": 2.0,
+             "reference_e": 0.0, "reference_n": 0.0, "reference_u": 2.0,
+             "actual_speed": speed, "reference_speed": 2.2, "error": 0.0}
+            for timestamp, speed in ((0.0, 0.0), (1.0, 2.1))
+        ]
+        figure = _plot_target_response(plot, samples)
+        try:
+            speed_axis = next(axis for axis in figure.axes if axis.get_title() == "target speed")
+            lines = speed_axis.lines
+            self.assertEqual([line.get_label() for line in lines], ["target actual", "reference", "2 m/s"])
+            self.assertEqual(list(lines[0].get_ydata()), [0.0, 2.1])
+        finally:
+            plot.close(figure)
+
+    def test_tracker_distance_plot_contains_actual_and_desired(self) -> None:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plot
+
+        samples = [{"t": 0.0, "target_e": 5.0, "target_n": 0.0, "target_u": 2.0,
+                    "desired_e": 0.0, "desired_n": 0.0, "desired_u": 2.0,
+                    "tracker_e": 0.0, "tracker_n": 0.0, "tracker_u": 2.0,
+                    "horizontal_distance": 5.2, "desired_distance": 5.0,
+                    "error": 0.2, "measurement_error": 0.0}]
+        figure = _plot_tracker_response(plot, samples, samples)
+        try:
+            distance_axis = next(axis for axis in figure.axes if axis.get_title() == "horizontal follow distance")
+            self.assertEqual([line.get_label() for line in distance_axis.lines], ["actual", "desired"])
+        finally:
+            plot.close(figure)
 
     def test_tracker_plot_is_written(self) -> None:
         record = {
@@ -87,6 +126,8 @@ class ResponsePlotTest(unittest.TestCase):
                     "reference_e": 0.0,
                     "reference_n": 0.0,
                     "reference_u": 2.0,
+                    "actual_speed": 0.0,
+                    "reference_speed": 0.0,
                 },
                 {
                     "t": 1.0,
@@ -97,6 +138,8 @@ class ResponsePlotTest(unittest.TestCase):
                     "reference_e": 0.5,
                     "reference_n": 0.0,
                     "reference_u": 2.0,
+                    "actual_speed": 0.5,
+                    "reference_speed": 0.5,
                 },
             ],
         }
@@ -112,6 +155,81 @@ class ResponsePlotTest(unittest.TestCase):
             ],
         }
         self._assert_plot(record)
+
+    def test_tracker_estimation_plots_cover_nine_axes(self) -> None:
+        record = {
+            "task": "tracker-v0",
+            "samples": [
+                {
+                    "t": 0.0,
+                    "error": 0.1,
+                    "measurement_error": 0.02,
+                    "estimate_error": 0.03,
+                    "target_e": 1.0, "target_n": 2.0, "target_u": 3.0,
+                    "target_ve": 0.0, "target_vn": 0.0, "target_vu": 0.0,
+                    "target_ae": 0.0, "target_an": 0.0, "target_au": 0.0,
+                    "measurement_e": 1.02, "measurement_n": 1.98, "measurement_u": 3.01,
+                    "estimate_e": 1.0, "estimate_n": 2.0, "estimate_u": 3.0,
+                    "estimate_ve": 0.0, "estimate_vn": 0.0, "estimate_vu": 0.0,
+                    "estimate_ae": 0.0, "estimate_an": 0.0, "estimate_au": 0.0,
+                    "tracker_e": 0.0, "tracker_n": 2.0, "tracker_u": 3.0,
+                    "desired_e": 0.0, "desired_n": 2.0, "desired_u": 3.0,
+                },
+                {
+                    "t": 1.0,
+                    "error": 0.0,
+                    "measurement_error": 0.0,
+                    "estimate_error": 0.01,
+                    "target_e": 2.0, "target_n": 2.2, "target_u": 3.0,
+                    "target_ve": 1.0, "target_vn": 0.2, "target_vu": 0.0,
+                    "target_ae": 1.0, "target_an": 0.2, "target_au": 0.0,
+                    "measurement_e": 1.98, "measurement_n": 2.21, "measurement_u": 2.99,
+                    "estimate_e": 1.99, "estimate_n": 2.2, "estimate_u": 3.0,
+                    "estimate_ve": 0.8, "estimate_vn": 0.2, "estimate_vu": 0.0,
+                    "estimate_ae": 0.8, "estimate_an": 0.2, "estimate_au": 0.0,
+                    "tracker_e": 1.0, "tracker_n": 2.0, "tracker_u": 3.0,
+                    "desired_e": 1.0, "desired_n": 2.0, "desired_u": 3.0,
+                },
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory) / "tracking-run"
+            paths = write_tracker_estimation_plots(output_dir, record)
+            # 9 张单轴估计图 + 3 张跟踪器图。
+            self.assertEqual(len(paths), 12)
+            for path in paths:
+                self.assertTrue(path.is_file(), str(path))
+                self.assertGreater(path.stat().st_size, 0, str(path))
+            for quantity in ("position", "velocity", "acceleration"):
+                for axis in ("east", "north", "up"):
+                    self.assertTrue((output_dir / "figures" / f"{quantity}_{axis}.png").is_file())
+            for name in (
+                "tracker_horizontal_trajectory.png",
+                "tracker_position_tracking.png",
+                "tracker_error.png",
+            ):
+                self.assertTrue((output_dir / "figures" / name).is_file())
+
+            for sample in record["samples"]:
+                sample["target_ae"] = float("nan")
+                sample["target_an"] = float("nan")
+                sample["target_au"] = float("nan")
+            record["target_samples"] = record["samples"]
+            self.assertEqual(len(write_tracker_estimation_plots(output_dir, record)), 12)
+
+    def test_unique_target_stream_overrides_held_control_samples(self) -> None:
+        held_control_samples = [{"t": 0.0, "target_e": 1.0}, {"t": 0.2, "target_e": 1.0}]
+        unique_target_samples = [{"t": 0.0, "target_e": 1.0}, {"t": 0.1, "target_e": 1.1}]
+
+        selected = _target_samples(
+            {"target_samples": unique_target_samples}, held_control_samples
+        )
+
+        self.assertIs(selected, unique_target_samples)
+        self.assertTrue(all(
+            later["t"] > earlier["t"]
+            for earlier, later in zip(selected, selected[1:])
+        ))
 
     def _assert_plot(self, record: dict) -> None:
         with tempfile.TemporaryDirectory() as directory:

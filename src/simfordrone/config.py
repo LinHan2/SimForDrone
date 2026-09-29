@@ -10,13 +10,15 @@ import yaml
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CONFIG = PROJECT_ROOT / "configs" / "dual_uav_hangar.yaml"
+DEFAULT_CONFIG = PROJECT_ROOT / "configs" / "dual_uav_outdoor.yaml"
 
 
 def load_dual_uav_config() -> dict[str, Any]:
     """加载场景参数；可用 SIMFORDRONE_CONFIG 指向同结构的实验配置。"""
 
     config_path = Path(os.environ.get("SIMFORDRONE_CONFIG", DEFAULT_CONFIG)).expanduser()
+    if not config_path.is_absolute():
+        config_path = PROJECT_ROOT / config_path
     if not config_path.is_file():
         raise FileNotFoundError(f"找不到 SimForDrone YAML 配置: {config_path}")
     with config_path.open(encoding="utf-8") as handle:

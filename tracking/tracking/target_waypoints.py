@@ -19,7 +19,13 @@ from px4ctrl.params import load_params
 from px4ctrl.plotting import PICTURE_DIR, write_response_plot
 from px4ctrl.vehicle import resolve_role
 from tracking.guidance import TargetState, Vector3
-from tracking.state_io import DEFAULT_STATE_HOST, DEFAULT_STATE_PORT, TargetStatePublisher
+from tracking.state_io import (
+    DEFAULT_STATE_HOST,
+    DEFAULT_STATE_PORT,
+    MirroredTargetStatePublisher,
+    TargetStatePublisher,
+    TargetStatePublisherProtocol,
+)
 from tracking.trajectory import TrajectoryCycle, WaypointSegment
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -55,6 +61,8 @@ def parse_args() -> argparse.Namespace:
         help="相对 target 起飞点的 ENU 航点（m），可重复；默认直线往返",
     )
     parser.add_argument("--start-delay", type=float, default=15.0, help="起飞稳定后等待 tracker 的时间（s）")
+    parser.add_argument("--start-gate-file", type=Path, help="等待编排脚本创建此文件后才开始航迹")
+    parser.add_argument("--start-gate-timeout", type=float, default=120.0, help="等待航迹放行的最长时间（s）")
     parser.add_argument("--dwell", type=float, default=5.0, help="到达每个航点后的停留时间（s）")
     parser.add_argument("--final-hold", type=float, default=15.0, help="末航点完成后继续悬停和发布状态（s）")
     parser.add_argument("--tolerance", type=float, default=0.25, help="航点到达半径（m）")
@@ -70,6 +78,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-accel", type=float, default=0.25, help="航段最大加速度（m/s²）")
     parser.add_argument("--state-host", default=DEFAULT_STATE_HOST)
     parser.add_argument("--state-port", type=int, default=DEFAULT_STATE_PORT)
+    parser.add_argument(
+        "--shadow-state-port",
+        type=int,
+        default=14601,
+        help="只读 shadow EKF 的镜像 target 状态 UDP 端口",
+    )
     parser.add_argument("--output-root", type=Path, default=ROOT / "logs" / "tracking")
     return parser.parse_args()
 
@@ -83,7 +97,12 @@ def task_defaults(params) -> argparse.Namespace:
     return args
 
 
-def publish_state(link: MavlinkLink, publisher: TargetStatePublisher, now: float) -> None:
+def publish_state(
+    link: MavlinkLink,
+    publisher: TargetStatePublisherProtocol,
+    now: float,
+    reference_acceleration: Vector3 | None = None,
+) -> None:
     """把 target 当前共享 ENU 位置/速度发给 tracker 进程。
 
     共享位置尚未就绪时静默跳过：`shared_position` 依赖 GLOBAL_POSITION_INT，
@@ -91,7 +110,12 @@ def publish_state(link: MavlinkLink, publisher: TargetStatePublisher, now: float
     """
 
     if link.shared_position is not None:
-        publisher.publish(TargetState(p=link.shared_position, v=link.odom.v), timestamp=now)
+        publisher.publish(
+            TargetState(p=link.shared_position, v=link.odom.v),
+            timestamp=now,
+            attitude=link.odom.q,
+            reference_acceleration=reference_acceleration,
+        )
 
 
 def parse_interactive_command(line: str) -> tuple[str, tuple[float, float, float] | None]:
@@ -148,10 +172,19 @@ def reference_from_trajectory(
     )
 
 
+def normalize_sample_times(samples: list[dict[str, float]]) -> list[dict[str, float]]:
+    """把所有 target 模式的日志统一为从首个记录样本开始的相对时间。"""
+
+    if not samples:
+        return []
+    started = samples[0]["t"]
+    return [{**sample, "t": sample["t"] - started} for sample in samples]
+
+
 def run_interactive(
     link: MavlinkLink,
     fsm: PX4CtrlFSM,
-    publisher: TargetStatePublisher,
+    publisher: TargetStatePublisherProtocol,
     home: tuple[float, float, float],
     rate: float,
     tolerance: float,
@@ -277,8 +310,9 @@ def main() -> int:
         or args.final_hold < 0.0
         or args.probe_seconds <= 0.0
         or args.tolerance <= 0.0
+        or args.start_gate_timeout <= 0.0
     ):
-        raise ValueError("start-delay/dwell/final-hold 必须非负，probe-seconds/tolerance 必须为正")
+        raise ValueError("start-delay/dwell/final-hold 必须非负，其余等待时间和容差必须为正")
     if args.max_speed <= 0.0 or args.max_accel <= 0.0:
         raise ValueError("max-speed 与 max-accel 必须为正")
     if args.trajectory is not None and (args.interactive or args.point):
@@ -292,7 +326,12 @@ def main() -> int:
     defaults = task_defaults(params)
     link = MavlinkLink(params.link, resolve_role("target"), shared_frame=params.shared_frame)
     fsm = PX4CtrlFSM(params, LinearControl(params), link, log=lambda message: print(f"[target] {message}"))
-    publisher = TargetStatePublisher(args.state_host, args.state_port)
+    if args.shadow_state_port == args.state_port:
+        raise ValueError("shadow-state-port 必须与 state-port 不同")
+    publisher = MirroredTargetStatePublisher(
+        TargetStatePublisher(args.state_host, args.state_port),
+        TargetStatePublisher(args.state_host, args.shadow_state_port),
+    )
     task_name = "target-trajectory" if args.trajectory is not None else "target-waypoints"
     output_dir = args.output_root / f"{task_name}-{time.strftime('%Y%m%d-%H%M%S')}"
     record: dict[str, object] = {"task": task_name, "points": points, "execute": not args.probe}
@@ -329,13 +368,24 @@ def main() -> int:
         else:
             raise RuntimeError("target 起飞后 45s 内未进入 AUTO_HOVER")
 
-        print(f"target 已悬停，等待 tracker {args.start_delay:.1f}s")
+        print(f"target 已悬停，等待 tracker {args.start_delay:.1f}s", flush=True)
         wait_until = time.monotonic() + args.start_delay
         while time.monotonic() < wait_until:
             now = time.monotonic()
             fsm.process(now)
             publish_state(link, publisher, now)
             time.sleep(rate)
+
+        if args.start_gate_file is not None:
+            print(f"target 悬停等待航迹放行：{args.start_gate_file}", flush=True)
+            gate_deadline = time.monotonic() + args.start_gate_timeout
+            while not args.start_gate_file.is_file():
+                if time.monotonic() >= gate_deadline:
+                    raise RuntimeError("target 等待航迹放行超时")
+                now = time.monotonic()
+                fsm.process(now)
+                publish_state(link, publisher, now)
+                time.sleep(rate)
 
         if args.interactive:
             # 交互模式：不做固定航点序列，由操作员随时输入并决定何时 land。
@@ -379,11 +429,13 @@ def main() -> int:
                 )
                 fsm.set_command(CommandData(p=reference_p, v=reference_v, a=reference_a, yaw=0.0))
                 fsm.process(now)
-                publish_state(link, publisher, now)
+                publish_state(link, publisher, now, reference_a)
                 error = math.dist(link.odom.p, reference_p)
                 samples.append(
                     {
-                        "t": now,
+                        # 轨迹日志必须使用相对时间；绝对 monotonic 时间会使独立运行的
+                        # target/tracker 曲线无法直接对齐。
+                        "t": elapsed,
                         "waypoint": 0.0,
                         "error": error,
                         "actual_e": link.odom.p[0],
@@ -392,6 +444,8 @@ def main() -> int:
                         "reference_e": reference_p[0],
                         "reference_n": reference_p[1],
                         "reference_u": reference_p[2],
+                        "actual_speed": math.sqrt(sum(value**2 for value in link.odom.v)),
+                        "reference_speed": math.sqrt(sum(value**2 for value in reference_v)),
                         "tilt_saturated": float(fsm.controller.debug.tilt_saturated),
                     }
                 )
@@ -482,13 +536,17 @@ def main() -> int:
                 publish_state(link, publisher, now)
                 time.sleep(rate)
 
-        record["samples"] = samples[:: max(1, len(samples) // 300)]
+        normalized_samples = normalize_sample_times(samples)
+        record["samples"] = normalized_samples[:: max(1, len(normalized_samples) // 300)]
         if samples:
             record["reference_error_mean_m"] = sum(sample["error"] for sample in samples) / len(samples)
             record["reference_error_max_m"] = max(sample["error"] for sample in samples)
             record["tilt_saturated_samples"] = sum(
                 int(sample.get("tilt_saturated", 0.0)) for sample in samples
             )
+        # 终态必须在停止状态发布前显式传达给 tracker。超时仍表示 target 可能崩溃，
+        # 因此 tracker 只接受这个受验证的 completed 事件作为正常结束。
+        publisher.publish_terminal("completed")
         record.update(finish(link, fsm, defaults.landing_timeout, print, defaults.disarm_timeout))
         passed = bool(record.get("on_ground")) and bool(record.get("disarmed"))
         record["passed"] = passed
@@ -510,7 +568,8 @@ def main() -> int:
         return 1
     finally:
         if samples and "samples" not in record:
-            record["samples"] = samples[:: max(1, len(samples) // 300)]
+            normalized_samples = normalize_sample_times(samples)
+            record["samples"] = normalized_samples[:: max(1, len(normalized_samples) // 300)]
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "run.json").write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         plot_path = write_response_plot(output_dir, record, picture_dir=PICTURE_DIR)
@@ -521,10 +580,16 @@ def main() -> int:
                 json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
             )
             print(f"PLOT: {plot_path}；归档: {record['picture_plot']}")
+        elif not record.get("samples"):
+            print("PLOT SKIPPED: 飞行未进入轨迹采样阶段，没有可绘制的轨迹数据；请检查 FAIL/INTERRUPT。", file=sys.stderr)
         publisher.close()
         link.close()
         print(f"LOG: {output_dir}")
 
 
 if __name__ == "__main__":
+    import signal
+
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
     raise SystemExit(main())

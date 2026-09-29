@@ -1,8 +1,9 @@
 # SimForDrone
 
-用于双无人机视觉跟踪的可复现实验工程。当前已通过“仿真、两套 PX4 SITL、ROS 2 观测接口”
-的最低运行时验收，并已接入 **px4ctrl 控制环**（姿态+推力闭环，仿真/真机同一套控制器）；
-尚未接入双机跟踪制导、视觉位姿估计或 EKF。
+用于双无人机视觉跟踪的可复现实验工程。当前已通过“仿真（含带物体的室内环境与显式光照）、
+两套 PX4 SITL、ROS 2 观测接口”的最低运行时验收，已接入 **px4ctrl 控制环**（姿态+推力闭环，
+仿真/真机同一套控制器）与真值双机跟踪制导（保守八字基准已通过）；尚未接入视觉位姿估计，
+相对 EKF 仍处于影子验证前阶段。
 
 ```text
 SimForDrone/
@@ -14,7 +15,8 @@ SimForDrone/
 ├── env/           # 项目运行环境：Isaac 内部 ROS 与系统 ROS 严格隔离
 ├── src/simfordrone/
 │   ├── dual_uav_observation.py  # 项目拥有的双机场景定义
-│   ├── industrial_hangar.py      # 官方 Isaac Warehouse USD 环境引用
+│   ├── industrial_hangar.py      # 官方 Isaac 环境 USD 载入（空场景直接报错）
+│   ├── lighting.py              # YAML 驱动的环境光/太阳光/室内补光
 │   └── pegasus_compat.py        # 不改第三方源码的兼容层
 ├── utils/         # 只读检查和小工具
 ├── READMELIST/    # 每阶段的操作、日志与验收标准
@@ -34,8 +36,8 @@ SimForDrone/
 所有项目模块变更必须更新 [项目进度](READMELIST/progress.md)；运行命令集中在
 [运行手册](READMELIST/runbook.md)，而“命令到无人机之间的完整调用链、环境画像、
 进程间通信与端口归属”见 [调用关系整理](READMELIST/invocation_map.md)。
-控制律、$SO(3)$ 姿态误差、推力模型和安全边界见
-[控制与推力建模方法](READMELIST/control_method.md)。
+控制律、相对 EKF、时间采样语义、推力模型和安全边界见
+[双机相对 EKF 与控制工具链](READMELIST/relative_ekf_noise_convergence.md)。
 
 `scripts/env/activate_isaacsim_internal_ros.sh` 只能由 Isaac 启动脚本在子进程中加载；
 `scripts/env/activate_system_ros2_jazzy.sh` 只能在验收或算法终端加载。二者不能在同一进程混用。

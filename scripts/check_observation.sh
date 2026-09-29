@@ -22,7 +22,11 @@ esac
 
 required_topics=(
     /target_uav_0/state/pose
+    /target_uav_0/state/accel
+    /target_uav_0/sensors/imu
     /tracker_uav_1/state/pose
+    /tracker_uav_1/state/accel
+    /tracker_uav_1/sensors/imu
     /tracker_uav_1/front_camera/color/image_raw
     /tracker_uav_1/front_camera/color/camera_info
     /tracker_uav_1/front_camera/depth
@@ -42,8 +46,9 @@ done
 (( missing == 0 )) || exit 1
 
 echo
-echo "Sampling one pose and camera calibration message (15 s timeout each):"
+echo "Sampling target pose, target IMU, and tracker camera calibration (15 s timeout each):"
 timeout 15s ros2 topic echo --once /tracker_uav_1/state/pose
+timeout 15s ros2 topic echo --once /target_uav_0/sensors/imu
 timeout 15s ros2 topic echo --once /tracker_uav_1/front_camera/color/camera_info
 
 if (( check_rgbd )); then

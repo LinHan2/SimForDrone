@@ -32,6 +32,41 @@ viewport:
   target: [0.0, 0.0, 1.5]
 
 environment:
-  # 官方 Isaac Sim 5.1 开放网格。动态双机试验不受货架/叉车遮挡，便于观察八字轨迹。
-  asset_url: https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/Isaac/Environments/Grid/default_environment.usd
+  # 官方 Isaac Sim 室内环境预设名，取自 Pegasus 的 SIMULATION_ENVIRONMENTS 表
+  # （路径随 Isaac 版本由上游给出，不在这里写死 Assets/Isaac/5.1）。
+  #
+  # 注意：Grid/default_environment.usd 是**空网格**：没有物体、光照也不足，
+  # 只适合飞控真值试验，不能用于图像闭环。图像闭环必须使用有物体的室内环境。
+  # 可切换的仓库类预设：Warehouse / Warehouse with Forklifts /
+  # Warehouse with Shelves / Full Warehouse，也可改用 asset_url 指向自定义 USD。
+  # preset 与 asset_url 只能二选一。
+  preset: Full Warehouse
+  asset_url:
   prim_path: /World/layout
+  # 光照由 simfordrone.lighting 显式建立，不依赖环境资产自带的灯：
+  # 环境光（dome）提供整体底光，太阳光（sun）给出方向感与阴影，
+  # 天花板补光（rect_lights）把室内照度抬到可做视觉估计的水平。
+  lighting:
+    root: /World/lights
+    dome:
+      enabled: true
+      intensity: 1000.0
+      color: [1.0, 1.0, 1.0]
+    sun:
+      enabled: true
+      intensity: 1500.0
+      color: [1.0, 0.97, 0.92]
+      angle_deg: 1.5
+      elevation_deg: 55.0
+      azimuth_deg: 135.0
+    rect_lights:
+      - prim_path: /World/lights/fill_south
+        intensity: 900.0
+        color: [0.95, 0.97, 1.0]
+        size: [8.0, 8.0]
+        position: [-4.0, -4.0, 6.0]
+      - prim_path: /World/lights/fill_north
+        intensity: 900.0
+        color: [0.95, 0.97, 1.0]
+        size: [8.0, 8.0]
+        position: [4.0, 4.0, 6.0]

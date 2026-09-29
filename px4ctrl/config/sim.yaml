@@ -7,7 +7,7 @@ ctrl_freq_max: 100.0 # 控制周期上限；实际下发频率由 CLI 的 --rate
 # false：发送四元数姿态；true：发送 SO(3) 群误差生成的 FLU body-rate。
 # body-rate 模式尚只经离线测试，必须完成新的单机验收后才能用于飞行。
 use_bodyrate_ctrl: false
-max_angle: 25.0      # 倾角限幅（度）；负值表示不限制
+max_angle: 35.0      # 倾角限幅（度）；负值表示不限制。与上游 px4ctrl 一致：只限幅、不因持续饱和回退悬停；35° 仍低于 PX4 默认最大倾角 45°
 max_manual_vel: 2.5
 
 auto_takeoff_land:

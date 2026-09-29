@@ -3,15 +3,15 @@
 | 阶段 | 状态 | 证据/下一步 |
 |---|---|---|
 | P0：Isaac/PX4/WebRTC | 已运行 | Isaac Sim 5.1.0、Pegasus v5.1.0、两套 PX4 SITL 已启动；WebRTC 可查看。 |
-| P1：双机观测 | 已通过最低验收 | 两机 `PoseStamped`、tracker RGB、CameraInfo、Depth 均已发布；RGB-D 内部同步已验证。 |
-| P1.1：Warehouse 取景质量 | 已降级（非阻塞） | 官方 `full_warehouse.usd` 已加载；画面构图不作为验收项，仅为可选人工检查。 |
+| P1：双机观测 | **在线完整验收通过** | 两机 `PoseStamped`、世界系 `AccelStamped`、原始 `Imu` 与 tracker RGB、CameraInfo、Depth 均已实际采样；`check_observation.sh --rgbd` 通过。RGB/Depth/CameraInfo 内部同步，但与世界位姿仍使用不同时间基准，尚不可直接进入视觉闭环。证据 `logs/scene_rgb_checks/20260927-015255/`。 |
+| P1.1：场景环境与光照 | **已通过** | 官方 `Full Warehouse` 载入 **26329 个 prim**；显式环境光/太阳光/室内补光共 4 盏；机载 RGB 可读性判据通过（对比度 `114.2`、边缘密度 `0.0995`、深度全像素有效）。证据 `logs/scene_rgb_checks/20260927-015255/`。 |
 | P2.0：tracker 起飞验证 | 已通过 | `TAKEOFF/ARM/LAND` 均接受；ROS 位姿最高 `2.515 m`、最终 `0.055 m`。 |
 | P2.1-T0：目标机单机验证 | **已通过** | Offboard 路线：最高 `2.012 m`、站位误差均值 `0.041 m`、落地并确认上锁。证据 `logs/offboard_hold/target-20260918-142828/`（旧验收器，已被 px4ctrl 取代）。 |
 | **px4ctrl 控制环** | **已落地并验证** | 唯一命令执行模块 `px4ctrl/`；姿态+推力闭环：最高 `1.974 m`、稳态误差均值 `0.023 m`、落地并上锁。证据 `logs/px4ctrl/hold-target-20260918-214430/`。 |
 | P2.1-T2：tracker 站位保持 | **已通过** | 稳态误差均值 `0.014 m`、最大 `0.020 m`（门槛 0.5 m）。证据 `logs/px4ctrl/hold-tracker-20260918-214228/`。 |
 | P2.2：多机共享坐标系 | **已实现并实测验证** | `GLOBAL_POSITION_INT` + 共用地理原点换算；与 ROS 真值同时刻对比偏差约 2 cm。 |
-| P2.3-T3：真值双机跟踪 | 已飞行，未通过验收 | target 八字轨迹正常完成并安全落地；tracker 可进入跟踪，但后段触发持续倾角饱和并在 target 结束后因状态超时退出。必须先降低动态难度并取得无饱和的双机基准。 |
-| P3：视觉位姿/EKF | 未开始 | `vision/` 仅有模块骨架；前置是完成可重复的真值双机动态基准，并录制带时间戳和真值的仿真图像数据。 |
+| P2.3-T3：真值双机跟踪 | **已通过保守基准** | 2026-09-27 保守八字：target/tracker 均 `result=completed`、落地并上锁，`tilt_saturated_samples=0`；tracker `error_mean=0.0547 m`、`error_max=0.2114 m`、`cmd_ctrl_fraction=1.0`。修复显式 `completed` 终态后不再被误判状态超时。证据 `logs/tracking/tracker-v0-20260927-000447/`。 |
+| P3：姿态约束相对 EKF | **在线输入链已验证，待低速飞行验收** | `relative-ekf` 状态源已把 target PX4 EKF 姿态、目标共享位置量测与 tracker IMU 比力接入 9 维相对 EKF；安全 probe 已实际输出估计位置/速度/加速度，未解锁、未发送控制。控制参考采用 EKF 输出的位置/速度/加速度。当前量测位置仍来自仿真共享真值，尚未替换为 RGB-D 6D 网络输出。 |
 
 `vision/` 已建立为独立模块，但按阶段约束暂不接入控制；T3/T4 通过后再以视觉相对位姿替换
 真值输入，所有飞控命令仍统一经过 `px4ctrl/`。
@@ -23,7 +23,11 @@
 - 场景、两套 PX4 SITL、WebRTC 与 ROS 2 观测接口已可运行；双机 dry-run、target 单机航点、
   自动降落与上锁均已验证。
 - `px4ctrl` 是唯一 MAVLink 控制出口；target 与 tracker 各自独占端口，目标状态经本机 UDP 转发。
-- 圆形、八字、螺旋轨迹、真值跟踪指标和响应图已实现；完整 `tracking/tests` 离线回归为 **80 项通过**。
+- 圆形、八字、螺旋轨迹、真值跟踪指标和响应图已实现；完整 `tracking/tests` 离线回归为 **87 项通过**，场景环境/光照配置回归为 **13 项通过**。
+- 估计器影子内核 `tracking/relative_ekf.py` 已按 Airsim2box 已调参实现重构：状态为
+  $x=[\delta p,\delta v,a_t,\alpha]^T$，使用 bearing-box 的 Lemma 1 归一化位置方向和目标推力方向 $h$。其姿态约束为
+  $$(I-hh^T)a_t=(I-hh^T)(0,0,-9.81)^T,$$
+  不估计也不接收 yaw；完整视觉前端需提供 3D box 八角点以计算 $\bar p$，当前共享位置仅作过渡接口代理。
 
 ### 最近双机动态结果
 
@@ -39,16 +43,60 @@
 - 固定航点默认使用 `v<=0.25 m/s, a<=0.25 m/s²`；显式命令行参数可覆盖，但不应在双机验收前提高。
 - SO(3) body-rate 模式仍关闭。此前观察到约 $150\,\mathrm{ms}$ 延迟下的 yaw 震荡，必须先完成单机
   低带宽阶跃验收，不能用于双机或真机。
-- `vision/` 尚未实现数据接入或姿态估计链路，当前只允许将仿真真值用于跟踪基准。
+- `relative-ekf` 已进入 tracker 的可选控制通路，但位置量测仍来自 target 进程的共享 ENU 真值；它是姿态/IMU/EKF 的在线集成基线，不构成视觉闭环验收。
+- `vision/` 仍未实现 RGB-D 6D 位姿网络与相机外参链路；在它替换上述位置量测前，不能宣称视觉估计已接入控制。
 
 ### 下一步
 
+0. **论文收敛**：全部新增实验按 [论文中心思想与实验收敛计划](paper_thesis.md) 的
+   "4 组核心实验 + 3 个理论命题 + 1 个真实双机闭环"边界执行；不能支撑核心科学结论
+   的实验不再列入计划。
 1. 使用比当前八字更保守的速度、加速度和半径，复飞无噪真值双机轨迹。
 2. 验收两端 `on_ground=true`、`disarmed=true`，tracker 的 `tilt_saturated_samples=0`，并检查
    `cmd_ctrl_fraction`、动态误差和响应图。
-3. 取得无饱和基准后，才用同一轨迹测试 `--state-source estimator`；视觉数据集与网络接入仍排在其后。
+3. 修复 target 正常结束的终止事件与 tracker 指标收尾后，取得无饱和真值基准。
+4. 以 `--state-source relative-ekf` 先做短时低速影子/闭环仿真，检查估计误差、协方差、量测年龄与 `tilt_saturated_samples`；通过前不提高轨迹速度。
+5. 将 RGB-D 6D 网络输出的相对位置、完整姿态、协方差和时间戳替换当前仿真共享位置量测，再进行视觉闭环验收。
+
+### 相对 EKF 离线内核（2026-09-26）
+
+- 新增 `tracking/relative_ekf.py`：相对位置定义为
+  $\delta p=p_{target}-p_{observer}$，所有量均在共享 ENU。过程模型显式使用 observer 的世界系
+  加速度；RGB-D 提供带尺度的相对位置，因此没有搬运 AirSim bearing-box 模型中的尺度状态。
+- 目标姿态只通过推力方向 $h$ 施加加速度投影约束。yaw 不进入滤波状态或量测接口；但当目标存在
+  roll/pitch 时，视觉前端必须从完整姿态正确计算 $h$，不能简单忽略 yaw 后直接复用倾角。
+- 聚焦估计器测试为 **14 项通过**：验证 ENU 悬停重力符号、匀速相对状态收敛、协方差有限/对称/半正定、
+  时间戳严格递增以及约束只依赖 $h$。完整 `tracking` 回归为 **87 项通过**。
+- 这些结果仅说明纯数学内核和合成数据路径正确；尚未构成视觉性能、仿真在线实时性或飞行控制验收。
 
 ## 最近记录
+
+### 场景环境与光照重建（2026-09-27）
+
+- **问题**：`configs/dual_uav_hangar.yaml` 的环境曾被改成 Isaac 的 `Grid/default_environment.usd`
+  （空网格）。该资产没有物体、光照也不足，只有一圈网格地板，无法支撑后续图像闭环——
+  这正是“环境没变、画面上什么都没有”的原因。
+- **次要根因（异步引用）**：`AddReference` 只是**登记**引用。本地 USD 可当帧合成，而
+  http(s) 资产由 omni.client 异步取回，当帧点数必然为 0。旧实现加了引用就直接往下跑，
+  因此即使换成 Warehouse 也会静默得到空场景。现在改为主动推进应用更新循环，直到引用真正
+  展开或超时（300 s），并打印等待进度。
+- **修复**：
+  1. 环境改为按 **预设名** 解析（取自 Pegasus 的 `SIMULATION_ENVIRONMENTS`，避免写死
+     `Assets/Isaac/5.1`），默认 `Full Warehouse`；`preset` 与 `asset_url` 只能二选一，
+     未知键直接报错。
+  2. 新增 `src/simfordrone/lighting.py`：按 YAML 建立环境光（dome）、太阳光（distant）与
+     室内补光（rect），参数校验失败即报错，不做静默降级。
+  3. 载入后校验子 prim 数量，为 0 就抛异常——空场景不再能当成“加载成功”。
+- **在线证据**：启动日志 `[scene] 环境 Full Warehouse: 载入 26329 个 prim；光源 4 个`；
+  机载 RGB 可读性判据 `basic_observer_rgb_readable=true`（对比度 `113.8`，门槛 38；
+  边缘密度 `0.0995`，门槛 0.018）。采样时刻 tracker 位于 `(-3.03,-0.01,0.06)`、
+  target 位于 `(+2.97,-0.01,0.06)`，两机 y/z 一致，画面中央的机体即为 6 m 前的目标机，
+  说明机载相机朝向正确、目标在视野内。
+- **回归**：新增 `tests/test_scene_environment.py` **13 项通过**（含“出厂配置不得指向空网格”
+  这条断言）；完整 `tracking/tests` **87 项**仍全部通过，控制与制导代码未改动。
+- **待办/风险**：环境从空网格换成带货架与叉车的 Warehouse 后，飞行空间里出现了真实障碍物，
+  此前在空网格上取得的速度/高度包线必须在**新场景下重新确认无碰撞**；相机与位姿时间基准
+  仍未对齐，不能把该观测直接接入视觉控制或 EKF。
 
 ### SO(3) body-rate 外环（2026-09-21）
 

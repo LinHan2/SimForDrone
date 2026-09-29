@@ -304,10 +304,8 @@ class LinearControl:
         倾角约 ``θ²/3``（25° 时约 6%），使实际水平加速度超出指令同样的比例。这里用精确
         形式，未限幅时实际加速度严格等于指令值（由单测的几何一致性用例钉住）。
 
-        偏航用**实测值**（``odom``）而非 ``des.yaw``：倾角必须从当前姿态可达，并且
-        机体 z 轴方向与偏航有关。代价是 ``des.yaw`` 与当前偏航不一致的过渡期间，实际
-        加速度方向会随偏航一并旋转；本项目 ``des.yaw`` 恒为 0 且两机不偏航，故不构成
-        问题。
+        倾角反解必须使用合成最终姿态时的同一期望偏航；否则在偏航过渡期间，
+        目标推力方向会随实测与期望偏航的差值旋转，造成横向加速度误差。
         """
 
         magnitude = math.sqrt(des_a[0] ** 2 + des_a[1] ** 2 + des_a[2] ** 2)
@@ -427,15 +425,21 @@ class LinearControl:
 
         # 步骤 2：由总期望加速度反解倾角（含限幅）。
         tilt_divisor = self._tilt_divisor(des_a[2])
-        roll, pitch = self._tilt_from_acceleration(des_a, yaw_from_quaternion(odom.q), tilt_divisor)
-
-        # 倾角限幅（上游由 max_angle 参数表达；负值表示不限制）。
+        # 对水平加速度向量整体限幅；逐轴截断 roll/pitch 会允许组合倾角超出预算。
         limit = self.params.max_angle_rad
         tilt_saturated = False
         if math.isfinite(limit):
-            tilt_saturated = abs(roll) > limit or abs(pitch) > limit
-            roll = max(-limit, min(limit, roll))
-            pitch = max(-limit, min(limit, pitch))
+            horizontal = math.hypot(des_a[0], des_a[1])
+            max_horizontal = tilt_divisor * math.tan(limit)
+            if horizontal > max_horizontal:
+                tilt_saturated = True
+                scale = max_horizontal / horizontal
+                limited_a = (des_a[0] * scale, des_a[1] * scale, des_a[2])
+            else:
+                limited_a = des_a
+        else:
+            limited_a = des_a
+        roll, pitch = self._tilt_from_acceleration(limited_a, des.yaw, tilt_divisor)
 
         # 步骤 3：归一化推力。补偿系数取机体 z 轴在世界系的垂直分量 cosφ·cosθ：
         # 由 ``Rz(ψ)Ry(θ)Rx(φ)·ẑ = (sinθ·cosφ, −sinφ, cosθ·cosφ)`` 可知该式对任意

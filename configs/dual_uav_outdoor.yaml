@@ -1,0 +1,52 @@
+# 双机室外开阔场景配置。使用 Isaac Sim 自带的 Flat Plane（平坦地面），
+# 无室内障碍物，两机间距可以增大到 20m+，不需要换位即可验证长距离跟踪。
+
+px4:
+  rotor_input_scaling: 2000.0
+
+vehicles:
+  target:
+    vehicle_id: 0
+    stage_path: /World/target_uav
+    initial_position: [5.0, 0.0, 0.0]    # target 在东侧 10m，高度 3m
+    ros_namespace: target_uav_
+  tracker:
+    vehicle_id: 1
+    stage_path: /World/tracker_uav
+    initial_position: [-5.0, 0.0, 0.0]   # tracker 在西侧 -10m，高度 3m
+    ros_namespace: tracker_uav_
+
+observer_camera:
+  name: front_camera
+  depth: true
+  position: [0.30, 0.0, 0.0]
+  # 相机光轴朝机体 +X（东），天然朝向 target，20m 间距
+  orientation_deg: [0.0, 0.0, 180.0]
+  resolution: [1280, 720]
+  frequency_hz: 30.0
+  intrinsics: [[640.0, 0.0, 640.0], [0.0, 640.0, 360.0], [0.0, 0.0, 1.0]]
+  diagonal_fov_deg: 100.0
+
+viewport:
+  # 俯视整个场景
+  position: [0.0, -30.0, 15.0]
+  target: [0.0, 0.0, 2.0]
+
+environment:
+  # 使用 Isaac Sim 自带的平坦地面，无障碍物，适合长距离飞行
+  preset: Flat Plane
+  asset_url:
+  prim_path: /World/layout
+  lighting:
+    root: /World/lights
+    # 室外环境光（增强到类似白天明亮度）
+    dome:
+      enabled: true
+      intensity: 3500.0
+      color: [1.0, 1.0, 0.98]
+    # 太阳光（强烈日光）
+    sun:
+      enabled: true
+      intensity: 5000.0
+      color: [1.0, 0.98, 0.95]
+      angle_deg: 45.0

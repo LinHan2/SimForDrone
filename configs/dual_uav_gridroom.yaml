@@ -1,0 +1,48 @@
+# 双机弯曲网格房间配置。使用 Pegasus 示例常用的 Curved Gridroom，
+# 比 Full Warehouse 宽敞，两机间距 15m，有地面和墙面参考但无密集障碍物。
+
+px4:
+  rotor_input_scaling: 2000.0
+
+vehicles:
+  target:
+    vehicle_id: 0
+    stage_path: /World/target_uav
+    initial_position: [7.5, 0.0, 2.5]     # target 在东侧 7.5m
+    ros_namespace: target_uav_
+  tracker:
+    vehicle_id: 1
+    stage_path: /World/tracker_uav
+    initial_position: [-7.5, 0.0, 2.5]    # tracker 在西侧 -7.5m
+    ros_namespace: tracker_uav_
+
+observer_camera:
+  name: front_camera
+  depth: true
+  position: [0.30, 0.0, 0.0]
+  orientation_deg: [0.0, 0.0, 180.0]
+  resolution: [1280, 720]
+  frequency_hz: 30.0
+  intrinsics: [[640.0, 0.0, 640.0], [0.0, 640.0, 360.0], [0.0, 0.0, 1.0]]
+  diagonal_fov_deg: 100.0
+
+viewport:
+  position: [0.0, -20.0, 10.0]
+  target: [0.0, 0.0, 2.0]
+
+environment:
+  # Curved Gridroom：Pegasus 所有示例默认使用的环境，
+  # 宽敞、有视觉参考、无密集障碍物
+  preset: Curved Gridroom
+  asset_url:
+  prim_path: /World/layout
+  lighting:
+    root: /World/lights
+    dome:
+      enabled: true
+      intensity: 1200.0
+      color: [1.0, 1.0, 1.0]
+    sun:
+      enabled: true
+      intensity: 2000.0
+      color: [1.0, 1.0, 1.0]

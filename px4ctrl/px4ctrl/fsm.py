@@ -54,9 +54,8 @@ HANDOVER_TIMEOUT_S = 10.0
 THRUST_LOG_PERIOD_S = 5.0
 #: 判定“IMU 加速度符号/坐标系可疑”所需的最少负值样本数。
 NEGATIVE_ACCEL_WARN_SAMPLES = 20
-#: CMD_CTRL 的倾角持续受限超过该时长即回退悬停。一个正常的短暂限幅不触发；持续
-#: 饱和意味着当前位置环无法实现制导加速度，继续追踪只会累积位置误差并放大风险。
-TILT_SATURATION_HOVER_DELAY_S = 0.5
+# 倾角策略与上游 px4ctrl 对齐：控制器只按 ``max_angle`` 限幅（见 controller.py），
+# 持续限幅不再回退 AUTO_HOVER；``debug.tilt_saturated`` 仅作限幅诊断统计。
 
 
 class PX4CtrlFSM:
@@ -91,7 +90,6 @@ class PX4CtrlFSM:
         self._thrust_imu_warned = False
         self._thrust_sign_warned = False
         self._thrust_log_due = 0.0
-        self._tilt_saturation_started_at: float | None = None
 
     # -------------------------------------------------------------- 生命周期
 
@@ -138,7 +136,6 @@ class PX4CtrlFSM:
     def request_command_control(self) -> None:
         """把控制权交给制导层（``CMD_CTRL``）。"""
 
-        self._tilt_saturation_started_at = None
         self.state = State.CMD_CTRL
         self._log("CMD_CTRL：开始跟踪制导指令")
 
@@ -304,25 +301,8 @@ class PX4CtrlFSM:
             des, self.link.odom, self.link.imu, self.last_output, now=now
         )
 
-        # 只监测制导控制：起飞/降落阶段可能因任务本身短暂接近上限，不能把它们误判为
-        # 制导故障。控制器提供的是限幅**前**的显式标记，避免“恰好等于上限”的误判。
-        if self.state == State.CMD_CTRL and self.controller.debug.tilt_saturated:
-            if self._tilt_saturation_started_at is None:
-                self._tilt_saturation_started_at = now
-            elif now - self._tilt_saturation_started_at >= TILT_SATURATION_HOVER_DELAY_S:
-                duration = now - self._tilt_saturation_started_at
-                self._log(
-                    f"WARN: 倾角持续饱和 {duration:.3f}s（阈值 "
-                    f"{TILT_SATURATION_HOVER_DELAY_S:.3f}s），转 AUTO_HOVER 悬停"
-                )
-                self.request_hover(now)
-                self._tilt_saturation_started_at = None
-                # 本周期也必须立即改发悬停输出，不能再多发一次已饱和的制导设定点。
-                output = self.controller.calculate_control(
-                    self._hover_desired(), self.link.odom, self.link.imu, output, now=now
-                )
-        else:
-            self._tilt_saturation_started_at = None
+        # 倾角限幅只影响本周期输出，不回退状态（与上游 px4ctrl 语义一致）：
+        # ``debug.tilt_saturated`` 仅作为限幅诊断供采样与事后统计使用。
 
         # 归一化推力必须落在 [0, 1]，否则 PX4 端行为未定义。
         output.thrust = max(0.0, min(1.0, output.thrust))
