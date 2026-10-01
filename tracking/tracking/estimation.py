@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from tracking.guidance import TargetState, Vector3
-from tracking.relative_ekf import RelativePoseMeasurement, RelativeTargetEKF
+from tracking.relative_ekf import MetricPoseMeasurement, MetricRelativeTargetEKF, RelativePoseMeasurement, RelativeTargetEKF
 
 Quaternion = tuple[float, float, float, float]
 _GRAVITY_ENU: Vector3 = (0.0, 0.0, -9.81)
@@ -47,19 +47,18 @@ class ObserverKinematics:
 
 
 class RelativeEkfTargetEstimator:
-    """将 bearing-box 位置方向代理与目标姿态约束转换为制导可消费的目标状态。
+    """将米制相对位置与目标姿态约束转换为制导可消费的目标状态。
 
-    当前过渡前端以共享相对位置的方向模拟 Lemma 1 输出；完整前端将提供 3D box 八角点的
-    ``p_bar``。此类不读取 ROS、相机或 MAVLink，避免感知、制导和飞控耦合；目标速度不作为
-    量测直接透传，而由相对 EKF 的状态估计产生。
+    当前过渡前端以共享相对位置模拟 RGB-D 米制量测；真实图像输入尚未接入。
+    此类不读取 ROS、相机或 MAVLink；目标速度不作为量测直接透传。
     """
 
-    def __init__(self, filter_: RelativeTargetEKF | None = None) -> None:
-        self._filter = filter_ if filter_ is not None else RelativeTargetEKF()
+    def __init__(self, filter_: MetricRelativeTargetEKF | RelativeTargetEKF | None = None) -> None:
+        self._filter = filter_ if filter_ is not None else MetricRelativeTargetEKF()
         self.last_estimate: TargetState | None = None
 
     @property
-    def tuning(self) -> dict[str, float]:
+    def tuning(self) -> dict[str, float | None]:
         """返回内部 EKF 的实际 Q/R 标定参数。"""
 
         return self._filter.tuning
@@ -73,15 +72,16 @@ class RelativeEkfTargetEstimator:
         """融合共享系位置量测、目标姿态和观测机运动学状态。"""
 
         relative_position = _sub(measurement.p, observer.p)
-        estimate = self._filter.update(
-            RelativePoseMeasurement(
-                timestamp=measurement.timestamp,
-                relative_position=relative_position,
-                target_thrust_direction=_rotate_body_z(target_attitude),
-                stereo_range_m=measurement.stereo_range_m,
-            ),
-            observer_acceleration=observer.a,
-        )
+        if isinstance(self._filter, MetricRelativeTargetEKF):
+            if measurement.stereo_range_m is not None:
+                raise ValueError("米制三维位置量测不接受独立的 stereo_range_m")
+            frame = MetricPoseMeasurement(measurement.timestamp, relative_position,
+                                          _rotate_body_z(target_attitude))
+            estimate = self._filter.update(frame, observer_acceleration=observer.a)
+        else:
+            frame = RelativePoseMeasurement(measurement.timestamp, relative_position,
+                                            _rotate_body_z(target_attitude), measurement.stereo_range_m)
+            estimate = self._filter.update(frame, observer_acceleration=observer.a)
         self.last_estimate = TargetState(
             p=_add(observer.p, estimate.relative_position),
             v=_add(observer.v, estimate.relative_velocity),
@@ -97,6 +97,26 @@ def observer_world_acceleration(
 
     specific_force_world = _rotate_vector(attitude, specific_force_body)
     return _add(specific_force_world, _GRAVITY_ENU)
+
+
+def rgbd_relative_position(
+    pixel_x: float, pixel_y: float, depth_m: float,
+    fx: float, fy: float, cx: float, cy: float,
+    camera_to_world: Quaternion, camera_position_world: Vector3,
+    observer_position_world: Vector3,
+) -> Vector3:
+    """将已对齐的光学系像素 Z 深度反投影为共享 ENU 米制相对位置。"""
+
+    from math import isfinite
+
+    if not all(isfinite(value) for value in (pixel_x, pixel_y, depth_m, fx, fy, cx, cy)):
+        raise ValueError("像素、深度和相机内参必须有限")
+    if depth_m <= 0.0 or fx <= 0.0 or fy <= 0.0:
+        raise ValueError("深度与焦距必须为正")
+    camera_point = (depth_m * (pixel_x - cx) / fx,
+                    depth_m * (pixel_y - cy) / fy, depth_m)
+    target_world = _add(camera_position_world, _rotate_vector(camera_to_world, camera_point))
+    return _sub(target_world, observer_position_world)
 
 
 def _add(left: Vector3, right: Vector3) -> Vector3:

@@ -1,5 +1,6 @@
 import math
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -14,7 +15,8 @@ from tracking.estimation import (
     select_target_state,
 )
 from tracking.guidance import TargetState
-from tracking.relative_ekf import RelativePoseMeasurement, RelativeTargetEKF
+from tracking.relative_ekf import MetricPoseMeasurement, MetricRelativeTargetEKF, RelativePoseMeasurement, RelativeTargetEKF
+from tracking.run_tracker import parse_args as parse_tracker_args
 
 
 class EstimationBoundaryTest(unittest.TestCase):
@@ -94,6 +96,43 @@ class EstimationBoundaryTest(unittest.TestCase):
         held, lost_measurement = select_target_state("estimator", truth, 3.0, always_lost, estimator)
         self.assertIsNone(lost_measurement)
         self.assertEqual(held, first)
+
+
+class MetricRelativeTargetEKFTest(unittest.TestCase):
+    def test_tracker_constructs_metric_filter_without_scale(self) -> None:
+        from tracking.run_tracker import make_relative_ekf, parse_args
+
+        with patch("sys.argv", ["tracker"]):
+            estimator = make_relative_ekf(parse_args())
+        self.assertIsInstance(estimator._filter, MetricRelativeTargetEKF)
+        self.assertEqual(estimator._filter.covariance.shape, (9, 9))
+
+    def test_metric_position_has_no_scale_state(self) -> None:
+        estimator = MetricRelativeTargetEKF(position_std=0.05)
+        measurement = MetricPoseMeasurement(0.0, (3.0, 4.0, 1.0), (0.0, 0.0, 1.0))
+        estimate = estimator.update(measurement, (0.0, 0.0, 0.0))
+        np.testing.assert_allclose(estimate.relative_position, measurement.relative_position)
+        self.assertEqual(estimator.covariance.shape, (9, 9))
+        self.assertFalse(hasattr(estimate, "scale"))
+        self.assertNotIn("scale_process_std_m", estimator.tuning)
+
+    def test_missing_tilt_and_depth_predict_without_fabricated_measurement(self) -> None:
+        estimator = MetricRelativeTargetEKF()
+        estimator.update(MetricPoseMeasurement(0.0, (2.0, 0.0, 1.0), None), (0.0, 0.0, 0.0))
+        predicted = estimator.update(MetricPoseMeasurement(0.1, None, None), (0.0, 0.0, 0.0))
+        self.assertAlmostEqual(predicted.relative_position[0], 2.0)
+        with self.assertRaises(ValueError):
+            estimator.update(MetricPoseMeasurement(0.1, None, None), (0.0, 0.0, 0.0))
+
+    def test_three_metric_positions_estimate_velocity(self) -> None:
+        estimator = MetricRelativeTargetEKF(position_std=0.01)
+        for step in range(30):
+            time_s = 0.1 * step
+            estimate = estimator.update(
+                MetricPoseMeasurement(time_s, (2.0 + 0.4 * time_s, 1.0, 0.5), None),
+                (0.0, 0.0, 0.0),
+            )
+        self.assertAlmostEqual(estimate.relative_velocity[0], 0.4, delta=0.04)
 
 
 class RelativeTargetEKFTest(unittest.TestCase):

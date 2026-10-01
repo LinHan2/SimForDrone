@@ -42,9 +42,11 @@ class StampedTargetState:
     # 目标机 PX4 EKF 的 ENU/FLU 姿态。相对 EKF 用它约束目标加速度方向；旧发送端
     # 缺少该字段时按单位四元数处理，以保持状态通道的向后兼容。
     q: Quaternion = _IDENTITY_QUATERNION
+    attitude_timestamp: float | None = None
 
     def as_target_state(self) -> TargetState:
-        return TargetState(p=self.p, v=self.v)
+        # reference_a 缺失时保持零加速度：非解析任务不得用遥测速度差分伪造前馈。
+        return TargetState(p=self.p, v=self.v, a=self.reference_a or (0.0, 0.0, 0.0))
 
 
 @dataclass(frozen=True)
@@ -67,6 +69,7 @@ class TargetStatePublisher:
         timestamp: float | None = None,
         attitude: Quaternion = _IDENTITY_QUATERNION,
         reference_acceleration: Vector3 | None = None,
+        attitude_timestamp: float | None = None,
     ) -> None:
         self._sequence += 1
         message = StampedTargetState(
@@ -76,6 +79,7 @@ class TargetStatePublisher:
             v=state.v,
             reference_a=reference_acceleration,
             q=attitude,
+            attitude_timestamp=attitude_timestamp,
         )
         self._socket.sendto(json.dumps(asdict(message), separators=(",", ":")).encode(), self._destination)
 
@@ -105,6 +109,7 @@ class TargetStatePublisherProtocol(Protocol):
         timestamp: float | None = None,
         attitude: Quaternion = _IDENTITY_QUATERNION,
         reference_acceleration: Vector3 | None = None,
+        attitude_timestamp: float | None = None,
     ) -> None: ...
 
     def publish_terminal(self, result: str, timestamp: float | None = None) -> None: ...
@@ -126,9 +131,10 @@ class MirroredTargetStatePublisher:
         timestamp: float | None = None,
         attitude: Quaternion = _IDENTITY_QUATERNION,
         reference_acceleration: Vector3 | None = None,
+        attitude_timestamp: float | None = None,
     ) -> None:
         for publisher in self._publishers:
-            publisher.publish(state, timestamp, attitude, reference_acceleration)
+            publisher.publish(state, timestamp, attitude, reference_acceleration, attitude_timestamp)
 
     def publish_terminal(self, result: str, timestamp: float | None = None) -> None:
         for publisher in self._publishers:
@@ -220,9 +226,14 @@ class TargetStateSubscriber:
         ):
             raise ValueError("p/v/reference_a 必须是三元组，q 必须是四元组")
         timestamp = float(data["timestamp"])
+        attitude_timestamp = data.get("attitude_timestamp")
+        if attitude_timestamp is not None:
+            attitude_timestamp = float(attitude_timestamp)
         sequence = int(data.get("sequence", 0))
         # 非有限值（NaN/Inf）会直接进控制律并让整架飞机发散，必须在入口拦下。
         values = position + velocity + attitude + (timestamp,)
+        if attitude_timestamp is not None:
+            values += (attitude_timestamp,)
         if reference_acceleration is not None:
             values += reference_acceleration
         if sequence < 0 or not all(math.isfinite(value) for value in values):
@@ -236,6 +247,7 @@ class TargetStateSubscriber:
             v=velocity,  # type: ignore[arg-type]
             reference_a=reference_acceleration,  # type: ignore[arg-type]
             q=attitude,  # type: ignore[arg-type]
+            attitude_timestamp=attitude_timestamp,
         )
 
     def require_fresh(self, now: float, timeout: float) -> StampedTargetState:

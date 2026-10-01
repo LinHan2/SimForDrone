@@ -274,6 +274,7 @@ class MavlinkLink:
                 )
                 self.odom.q = attitude
                 self.odom.recv_time = now
+                self.odom.attitude_recv_time = now
                 # IMU 姿态用于控制器的姿态补偿。仿真里与 odom.q 同源，补偿退化为恒等；
                 # 真机上里程计来自 VIO 而 IMU 来自飞控，该项才真正起作用。
                 self.imu.q = attitude

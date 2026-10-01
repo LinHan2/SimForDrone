@@ -4,18 +4,35 @@ import unittest
 import numpy as np
 
 from tracking.shadow_observation import (
+    detected_relative_position_body,
     depth_roi_median,
+    observation_time_skew,
     pixel_ray_body,
     project_oracle_pixel,
     range_from_optical_depth,
+    relative_position_from_depth,
+    track_depth_roi,
 )
 
 
 class ShadowObservationGeometryTest(unittest.TestCase):
+    def test_observation_time_skew_uses_monotonic_arrivals(self) -> None:
+        self.assertAlmostEqual(observation_time_skew(10.1, 10.0, 10.04, 10.08), 0.1)
+        self.assertGreater(observation_time_skew(10.3, 10.0, 10.04, 10.08), 0.15)
+        self.assertGreater(observation_time_skew(10.0, 10.1, 10.04, 10.08), 0.0)
+        with self.assertRaises(ValueError):
+            observation_time_skew(10.1, math.nan, 10.04, 10.08)
+
     def test_depth_roi_median_rejects_invalid_and_resists_outlier(self) -> None:
         depth = np.array(((0.0, 2.0, 2.0), (2.0, 100.0, np.nan), (2.0, 2.0, 2.0)))
         self.assertEqual(depth_roi_median(depth, 1.0, 1.0, 1), 2.0)
         self.assertIsNone(depth_roi_median(np.zeros((3, 3)), 1.0, 1.0, 1))
+
+    def test_depth_roi_tracks_moving_patch_without_new_oracle_position(self) -> None:
+        depth = np.full((31, 31), 8.0)
+        depth[11:16, 14:19] = 4.0
+        self.assertEqual(track_depth_roi(depth, 13.0, 13.0, 4.0, 6, 0.3), (16.0, 13.0, 4.0))
+        self.assertIsNone(track_depth_roi(depth, 2.0, 2.0, 4.0, 4, 0.3))
 
     def test_center_pixel_points_forward_in_flu(self) -> None:
         ray = pixel_ray_body(640.0, 360.0, np.array(((640.0, 0.0, 640.0), (0.0, 640.0, 360.0), (0.0, 0.0, 1.0))))
@@ -70,6 +87,22 @@ class ShadowObservationGeometryTest(unittest.TestCase):
         self.assertIsNone(range_from_optical_depth(0.0, pixel_ray_body(640.0, 360.0, matrix)))
         self.assertIsNone(range_from_optical_depth(-1.0, pixel_ray_body(640.0, 360.0, matrix)))
         self.assertIsNone(range_from_optical_depth(math.nan, pixel_ray_body(640.0, 360.0, matrix)))
+
+    def test_metric_relative_position_includes_camera_mount_offset(self) -> None:
+        ray = pixel_ray_body(640.0, 360.0, np.array(((640.0, 0.0, 640.0), (0.0, 640.0, 360.0), (0.0, 0.0, 1.0))))
+        np.testing.assert_allclose(
+            relative_position_from_depth(ray, 5.0, (0.3, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)),
+            (5.3, 0.0, 0.0),
+        )
+
+    def test_detected_pixel_depth_rejects_outside_image(self) -> None:
+        matrix = np.array(((100.0, 0.0, 10.0), (0.0, 100.0, 10.0), (0.0, 0.0, 1.0)))
+        depth = np.full((21, 21), 5.0)
+        np.testing.assert_allclose(
+            detected_relative_position_body(depth, 10.0, 10.0, matrix, (0.3, 0.0, 0.0)),
+            (5.3, 0.0, 0.0),
+        )
+        self.assertIsNone(detected_relative_position_body(depth, 21.0, 10.0, matrix, (0.3, 0.0, 0.0)))
 
 
 if __name__ == "__main__":

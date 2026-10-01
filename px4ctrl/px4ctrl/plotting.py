@@ -123,10 +123,47 @@ def _plot_estimation_axis(
     return path
 
 
-def write_tracker_estimation_plots(output_dir: Path, record: dict[str, Any]) -> list[Path]:
-    """为 tracker 运行生成九张单轴估计图和三张跟踪器图。
+def _plot_tracker_trajectory_3d(
+    plot: Any, samples: list[dict[str, float]], target_samples: list[dict[str, float]]
+) -> Any:
+    """共享 ENU 双机航迹；Z 已朝上，不再翻转或冒充 EKF 重建轨迹。"""
 
-    九张图：位置/速度/加速度 × 东/北/上；跟踪器图：水平轨迹、三轴位置跟踪、误差。
+    figure = plot.figure(figsize=(10, 7), layout="constrained")
+    axis = figure.add_subplot(111, projection="3d")
+    trajectories = (
+        (target_samples, "target", "Target (PX4 shared ENU)", "tab:red", "-"),
+        (samples, "tracker", "Tracker (PX4 shared ENU)", "tab:blue", "-"),
+        (samples, "desired", "Desired tracker", "tab:green", "--"),
+    )
+    coordinates = [[], [], []]
+    for stream, prefix, label, color, style in trajectories:
+        values = [[sample[f"{prefix}_{key}"] for sample in stream] for key in ("e", "n", "u")]
+        axis.plot(*values, label=label, color=color, linestyle=style, linewidth=1.5)
+        axis.scatter(*(values[index][0] for index in range(3)), color=color, marker="o", s=25)
+        axis.scatter(*(values[index][-1] for index in range(3)), color=color, marker="x", s=35)
+        for dimension, points in zip(coordinates, values):
+            dimension.extend(value for value in points if math.isfinite(value))
+    spans = []
+    for dimension, set_limits in zip(coordinates, (axis.set_xlim, axis.set_ylim, axis.set_zlim)):
+        low, high = min(dimension), max(dimension)
+        span = max(high - low, 1.0)
+        center = (low + high) / 2
+        set_limits(center - span * 0.55, center + span * 0.55)
+        spans.append(span)
+    axis.set_box_aspect(spans)
+    axis.view_init(elev=25, azim=-65)
+    axis.set_xlabel("X / East (m)")
+    axis.set_ylabel("Y / North (m)")
+    axis.set_zlabel("Z / Up (m)")
+    axis.set_title("3D trajectories (shared ENU; circle=start, cross=end)")
+    axis.legend(loc="upper left", fontsize=9)
+    return figure
+
+
+def write_tracker_estimation_plots(output_dir: Path, record: dict[str, Any]) -> list[Path]:
+    """为 tracker 运行生成九张单轴估计图和四张跟踪器图。
+
+    九张图：位置/速度/加速度 × 东/北/上；跟踪器图：3D/水平轨迹、三轴位置跟踪、误差。
     返回生成的文件路径列表；调用方负责写入 run.json。
     """
 
@@ -145,6 +182,12 @@ def write_tracker_estimation_plots(output_dir: Path, record: dict[str, Any]) -> 
     paths: list[Path] = []
     try:
         figures_dir = output_dir / "figures"
+        figures_dir.mkdir(parents=True, exist_ok=True)
+        trajectory_3d = figures_dir / "tracker_trajectory_3d.png"
+        figure = _plot_tracker_trajectory_3d(plot, samples, target_samples)
+        figure.savefig(trajectory_3d, dpi=150, bbox_inches="tight")
+        plot.close(figure)
+        paths.append(trajectory_3d)
         for quantity in ("position", "velocity", "acceleration"):
             for axis in ("e", "n", "u"):
                 path = _plot_estimation_axis(plot, figures_dir, target_samples, quantity, axis)

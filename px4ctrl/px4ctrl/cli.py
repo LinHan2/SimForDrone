@@ -40,6 +40,7 @@ from px4ctrl.vehicle import available_roles, resolve_role
 
 DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "config" / "sim.yaml"
 COMMAND_STREAM_HZ_MIN = 2.0
+OFFBOARD_CONFIRM_TIMEOUT_S = 20.0
 #: 常规上锁后等待其生效的时间（s）；仍未生效则尝试强制上锁。
 DISARM_SETTLE_S = 5.0
 #: 收尾时等待上锁生效的默认时长（s）；由任务参数 ``disarm_timeout`` 覆盖。
@@ -279,19 +280,27 @@ def enter_offboard(link: MavlinkLink, fsm: PX4CtrlFSM, log: Callable[[str], None
     if link.params.force_arm:
         log("ARM：仿真配置跳过 PX4 preflight 检查")
     log(f"ARM: {link.arm(force=link.params.force_arm, tick=fsm.tick)}")
-    log(f"OFFBOARD: {link.set_offboard(tick=fsm.tick)}")
-
-    deadline = time.monotonic() + 5.0
-    while time.monotonic() < deadline:
-        fsm.tick()
-        if link.is_offboard():
-            log("OFFBOARD 已确认")
-            return
-        time.sleep(0.01)
+    for attempt in range(2):
+        previous_heartbeat = link.state.recv_time
+        log(f"OFFBOARD: {link.set_offboard(tick=fsm.tick)}")
+        deadline = time.monotonic() + OFFBOARD_CONFIRM_TIMEOUT_S
+        while time.monotonic() < deadline:
+            fsm.tick()
+            if link.state.recv_time > previous_heartbeat and link.is_offboard():
+                log("OFFBOARD 已确认")
+                return
+            if link.state.recv_time > previous_heartbeat and not link.state.armed:
+                raise RuntimeError("切换 Offboard 时 PX4 已上锁，停止重试")
+            time.sleep(0.01)
+        heartbeat_age = time.monotonic() - link.state.recv_time
+        if attempt == 0 and heartbeat_age < 2.0 and link.state.armed:
+            log("WARN: PX4 仍未进入 Offboard；保持设定点流并重试一次")
+            continue
+        break
     raise RuntimeError(
         "切换后未在 HEARTBEAT 中观测到 Offboard 主模式；"
         f"当前主模式={(link.state.custom_mode >> 16) & 0xFF}，"
-        f"armed={link.state.armed}，PX4 状态={link.last_statustext!r}"
+        f"armed={link.state.armed}，心跳年龄={heartbeat_age:.1f}s，PX4 状态={link.last_statustext!r}"
     )
 
 

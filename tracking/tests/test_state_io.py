@@ -4,7 +4,12 @@ import time
 import unittest
 
 from tracking.guidance import TargetState
-from tracking.state_io import MirroredTargetStatePublisher, TargetStatePublisher, TargetStateSubscriber
+from tracking.state_io import (
+    MirroredTargetStatePublisher,
+    StampedTargetState,
+    TargetStatePublisher,
+    TargetStateSubscriber,
+)
 from tracking.target_waypoints import normalize_sample_times, parse_interactive_command
 
 
@@ -29,6 +34,7 @@ class TargetStateTransportTest(unittest.TestCase):
             timestamp=10.0,
             attitude=(0.0, 0.0, 0.5, 0.5),
             reference_acceleration=(0.4, 0.5, 0.6),
+            attitude_timestamp=9.85,
         )
         received = subscriber.poll()
 
@@ -36,9 +42,18 @@ class TargetStateTransportTest(unittest.TestCase):
         assert received is not None
         self.assertEqual(received.timestamp, 10.0)
         self.assertEqual(received.sequence, 1)
-        self.assertEqual(received.as_target_state(), TargetState(p=(1.0, 2.0, 3.0), v=(0.1, 0.2, 0.3)))
+        self.assertEqual(
+            received.as_target_state(),
+            TargetState(p=(1.0, 2.0, 3.0), v=(0.1, 0.2, 0.3), a=(0.4, 0.5, 0.6)),
+        )
         self.assertEqual(received.q, (0.0, 0.0, 0.5, 0.5))
         self.assertEqual(received.reference_a, (0.4, 0.5, 0.6))
+        self.assertEqual(received.attitude_timestamp, 9.85)
+
+    def test_missing_reference_acceleration_stays_zero(self) -> None:
+        state = StampedTargetState(timestamp=1.0, sequence=1, p=(0.0,) * 3, v=(1.0, 0.0, 0.0))
+
+        self.assertEqual(state.as_target_state().a, (0.0, 0.0, 0.0))
 
     def test_publisher_sequence_is_strictly_increasing(self) -> None:
         port = unused_udp_port()
@@ -56,6 +71,7 @@ class TargetStateTransportTest(unittest.TestCase):
         self.assertEqual(received.sequence, 2)
         self.assertEqual(received.timestamp, 10.1)
         self.assertIsNone(received.reference_a)
+        self.assertIsNone(received.attitude_timestamp)
 
     def test_mirrored_publisher_reaches_control_and_shadow_ports(self) -> None:
         control_port = unused_udp_port()
@@ -73,12 +89,14 @@ class TargetStateTransportTest(unittest.TestCase):
             TargetState(p=(1.0, 2.0, 3.0), v=(0.1, 0.2, 0.3)),
             timestamp=10.0,
             attitude=(0.0, 0.0, 0.5, 0.5),
+            attitude_timestamp=9.85,
         )
 
         control_state = control_subscriber.poll()
         shadow_state = shadow_subscriber.poll()
         self.assertIsNotNone(control_state)
         self.assertEqual(control_state, shadow_state)
+        self.assertEqual(shadow_state.attitude_timestamp, 9.85)
 
     def test_rejects_stale_state(self) -> None:
         port = unused_udp_port()

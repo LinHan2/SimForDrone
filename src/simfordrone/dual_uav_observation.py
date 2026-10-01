@@ -241,6 +241,7 @@ class DualUavObservationApp:
             Rotation.from_euler("XYZ", [0.0, 0.0, 0.0], degrees=True).as_quat(),
             config=config,
         )
+        self._color_vehicle_body(stage_path, role)
         # 登记静态身份信息（stage 路径、序号、PX4 端点）。system_id 与 MAVLink 端口
         # 由 PX4 SITL 固定规则推出：system_id = instance+1、offboard 端口 = 14540+instance，
         # 与 px4ctrl/vehicle.py 的 VehicleRole 必须保持一致，否则会控制错机。
@@ -251,6 +252,23 @@ class DualUavObservationApp:
             "system_id": vehicle_id + 1,
             "mavlink_port": 14540 + vehicle_id,
         }
+
+    def _color_vehicle_body(self, stage_path: str, role: str) -> None:
+        from pxr import Gf, Sdf, UsdShade
+
+        color = {"target": (1.0, 0.35, 0.04), "tracker": (0.02, 0.8, 0.72)}[role]
+        body = self.world.stage.GetPrimAtPath(f"{stage_path}/body")
+        if not body.IsValid():
+            raise RuntimeError(f"Iris 机身节点不存在: {stage_path}/body")
+        material = UsdShade.Material.Define(self.world.stage, f"{stage_path}/Looks/RolePaint")
+        shader = UsdShade.Shader.Define(self.world.stage, f"{stage_path}/Looks/RolePaint/PreviewSurface")
+        shader.CreateIdAttr("UsdPreviewSurface")
+        shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*color))
+        shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.65)
+        material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
+        UsdShade.MaterialBindingAPI.Apply(body).Bind(
+            material, UsdShade.Tokens.strongerThanDescendants
+        )
 
     def _register_camera_paths(self) -> None:
         """在 stage 中查找各载具挂载的相机 prim，供机载视角切换使用。

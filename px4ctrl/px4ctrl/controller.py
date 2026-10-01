@@ -415,7 +415,8 @@ class LinearControl:
         out = ControllerOutput() if out is None else out
         gain = self.params.gain
 
-        # 步骤 1：PD 控制律 + 重力补偿。
+        # ENU: a_cmd,i = a_ff,i + Kv_i (v_ref,i - v_i) + Kp_i (p_ref,i - p_i)；
+        # 总期望加速度 a_total = a_cmd + (0, 0, g)。a_ff 由上游参考给定。
         des_a = (
             des.a[0] + gain.kv0 * (des.v[0] - odom.v[0]) + gain.kp0 * (des.p[0] - odom.p[0]),
             des.a[1] + gain.kv1 * (des.v[1] - odom.v[1]) + gain.kp1 * (des.p[1] - odom.p[1]),
@@ -425,6 +426,7 @@ class LinearControl:
 
         # 步骤 2：由总期望加速度反解倾角（含限幅）。
         tilt_divisor = self._tilt_divisor(des_a[2])
+        # ||a_xy|| <= tilt_divisor * tan(max_angle)；超限时同比缩放水平向量。
         # 对水平加速度向量整体限幅；逐轴截断 roll/pitch 会允许组合倾角超出预算。
         limit = self.params.max_angle_rad
         tilt_saturated = False

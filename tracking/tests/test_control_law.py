@@ -8,13 +8,110 @@ import math
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
+from px4ctrl.cli import enter_offboard
 from px4ctrl.controller import DesiredState, LinearControl
 from px4ctrl.fsm import PX4CtrlFSM, State
 from px4ctrl.inputs import CommandData, ImuData, OdomData, quaternion_from_yaw
 from px4ctrl.params import load_params
+from tracking.tracker_control import TrackerLinearControl, TrackingLimits
 
 SIM_CONFIG = Path(__file__).resolve().parents[2] / "px4ctrl" / "config" / "sim.yaml"
+
+
+class OffboardEntryTest(unittest.TestCase):
+    def test_stale_heartbeat_does_not_retry(self) -> None:
+        clock = [0.0]
+        link = SimpleNamespace(
+            params=SimpleNamespace(force_arm=False),
+            state=SimpleNamespace(recv_time=0.0, armed=True, custom_mode=4 << 16),
+            last_statustext="",
+        )
+        attempts = []
+        link.arm = lambda **kwargs: {"result": 0}
+        link.set_offboard = lambda **kwargs: attempts.append(clock[0]) or {"result": 0}
+        link.is_offboard = lambda: False
+        fsm = SimpleNamespace(enable=lambda: None, tick=lambda: clock.__setitem__(0, clock[0] + 0.25))
+        with patch("px4ctrl.cli.time.monotonic", side_effect=lambda: clock[0]), patch("px4ctrl.cli.time.sleep"):
+            with self.assertRaisesRegex(RuntimeError, "心跳年龄="):
+                enter_offboard(link, fsm, lambda message: None)
+        self.assertEqual(len(attempts), 1)
+
+    def test_accepts_delayed_offboard_heartbeat(self) -> None:
+        clock = [0.0]
+        link = SimpleNamespace(
+            params=SimpleNamespace(force_arm=False),
+            state=SimpleNamespace(recv_time=0.0, armed=True, custom_mode=4 << 16),
+            last_statustext="",
+        )
+        attempts = []
+        link.arm = lambda **kwargs: {"result": 0}
+        link.set_offboard = lambda **kwargs: attempts.append(clock[0]) or {"result": 0}
+        link.is_offboard = lambda: link.state.custom_mode >> 16 == 6
+
+        def tick():
+            clock[0] += 0.25
+            if attempts and clock[0] >= 9.0:
+                link.state.recv_time = clock[0]
+                link.state.custom_mode = 6 << 16
+
+        fsm = SimpleNamespace(enable=lambda: None, tick=tick)
+        with patch("px4ctrl.cli.time.monotonic", side_effect=lambda: clock[0]), patch("px4ctrl.cli.time.sleep"):
+            enter_offboard(link, fsm, lambda message: None)
+        self.assertEqual(len(attempts), 1)
+
+    def test_confirms_new_heartbeat_and_retries_once(self) -> None:
+        clock = [0.0]
+        link = SimpleNamespace(
+            params=SimpleNamespace(force_arm=False),
+            state=SimpleNamespace(recv_time=0.0, armed=True, custom_mode=4 << 16),
+            last_statustext="",
+        )
+        attempts = []
+        link.arm = lambda **kwargs: {"result": 0}
+
+        def set_offboard(**kwargs):
+            attempts.append(clock[0])
+            return {"result": 0}
+
+        def tick():
+            clock[0] += 0.25
+            link.state.recv_time = clock[0]
+            if len(attempts) == 2:
+                link.state.custom_mode = 6 << 16
+
+        link.set_offboard = set_offboard
+        link.is_offboard = lambda: link.state.custom_mode >> 16 == 6
+        fsm = SimpleNamespace(enable=lambda: None, tick=tick)
+        with patch("px4ctrl.cli.time.monotonic", side_effect=lambda: clock[0]), patch("px4ctrl.cli.time.sleep"):
+            enter_offboard(link, fsm, lambda message: None)
+        self.assertEqual(len(attempts), 2)
+
+    def test_stops_when_px4_disarms(self) -> None:
+        clock = [0.0]
+        link = SimpleNamespace(
+            params=SimpleNamespace(force_arm=False),
+            state=SimpleNamespace(recv_time=0.0, armed=True, custom_mode=4 << 16),
+            last_statustext="",
+        )
+        attempts = []
+        link.arm = lambda **kwargs: {"result": 0}
+        link.set_offboard = lambda **kwargs: attempts.append(clock[0]) or {"result": 0}
+        link.is_offboard = lambda: False
+
+        def tick():
+            clock[0] += 0.25
+            if attempts:
+                link.state.recv_time = clock[0]
+                link.state.armed = False
+
+        fsm = SimpleNamespace(enable=lambda: None, tick=tick)
+        with patch("px4ctrl.cli.time.monotonic", side_effect=lambda: clock[0]), patch("px4ctrl.cli.time.sleep"):
+            with self.assertRaisesRegex(RuntimeError, "已上锁"):
+                enter_offboard(link, fsm, lambda message: None)
+        self.assertEqual(len(attempts), 1)
 
 
 class FakeLink:
@@ -30,6 +127,107 @@ class FakeLink:
 
     def send_attitude_thrust(self, q, thrust, *, bodyrates=None) -> None:
         self.sent.append((q, thrust, bodyrates))
+
+
+class TrackerLimitsTest(unittest.TestCase):
+    def setUp(self):
+        self.params = replace(load_params(SIM_CONFIG), max_angle=10.0)
+        self.limits = TrackingLimits()
+        self.controller = TrackerLinearControl(self.params, self.limits)
+        self.controller.active = lambda: True
+        self.odom = OdomData(recv_time=1.0)
+
+    def test_full_pd_is_limited_without_double_counting(self):
+        desired = DesiredState(p=(10.0, -10.0, 5.0), v=(6.0, -6.0, 2.0), a=(4.0, -4.0, 3.0))
+        previous = (0.0, 0.0, 0.0)
+        for step in range(100):
+            self.controller.calculate_control(desired, self.odom, ImuData(), now=1.0 + step * 0.05)
+            acceleration = self.controller.tracking_debug["limited_acceleration"]
+            self.assertLessEqual(math.hypot(*acceleration[:2]), self.limits.horizontal + 1e-10)
+            self.assertTrue(self.limits.vertical_min <= acceleration[2] <= self.limits.vertical_max)
+            self.assertLessEqual(math.dist(previous, acceleration), self.limits.jerk * 0.05 + 1e-10)
+            self.assertLessEqual(math.hypot(*acceleration[:2]),
+                                 (self.params.gra + acceleration[2]) * math.tan(self.params.max_angle_rad) + 1e-10)
+            self.assertAlmostEqual(self.controller.debug.des_a[0], acceleration[0])
+            self.assertAlmostEqual(self.controller.debug.des_a[2] - self.params.gra, acceleration[2])
+            previous = acceleration
+            if step == 50:
+                desired = replace(desired, p=(-10.0, 10.0, -5.0), v=(-6.0, 6.0, -2.0))
+
+    def test_inactive_controller_matches_original_and_resets(self):
+        desired = DesiredState(p=(0.1, 0.2, 0.3), v=(0.1, 0.2, 0.0))
+        self.controller.active = lambda: False
+        actual = self.controller.calculate_control(desired, self.odom, ImuData(), now=1.0)
+        expected = LinearControl(self.params).calculate_control(desired, self.odom, ImuData(), now=1.0)
+        self.assertEqual(actual, expected)
+        self.controller.active = lambda: True
+        self.controller.calculate_control(desired, self.odom, ImuData(), now=2.0)
+        self.assertEqual(self.controller.tracking_debug["limited_acceleration"], (0.0, 0.0, 0.0))
+
+    def test_long_gap_does_not_allow_large_acceleration_jump(self):
+        desired = DesiredState(v=(6.0, 0.0, 0.0))
+        self.controller.calculate_control(desired, self.odom, ImuData(), now=1.0)
+        self.controller.calculate_control(desired, self.odom, ImuData(), now=10.0)
+        self.assertAlmostEqual(self.controller.tracking_debug["limited_acceleration"][0], 0.3)
+        with self.assertRaises(ValueError):
+            self.controller.calculate_control(desired, self.odom, ImuData(), now=9.0)
+
+    def test_invalid_limits_are_rejected(self):
+        for options in ({"jerk": 0.0}, {"horizontal": math.nan}, {"vertical_min": 1.0}):
+            with self.assertRaises(ValueError):
+                TrackingLimits(**options)
+
+    def test_timeout_uses_original_hover_and_fresh_odom(self):
+        link = FakeLink()
+        controller = TrackerLinearControl(self.params, self.limits)
+        fsm = PX4CtrlFSM(self.params, controller, link)
+        controller.active = lambda: fsm.state == State.CMD_CTRL
+        fsm.request_command_control()
+        fsm.set_command(CommandData(p=(2.0, 0.0, 0.0)), now=1000.0)
+        link.pump = lambda: setattr(link.odom, "p", (1.0, 0.0, 0.0))
+        fsm.process(1000.0)
+        self.assertAlmostEqual(controller.tracking_debug["raw_acceleration"][0], self.params.gain.kp0)
+        link.odom.recv_time = 1001.0
+        fsm.process(1001.0)
+        self.assertEqual(fsm.state, State.AUTO_HOVER)
+        self.assertEqual(controller.tracking_debug, {})
+
+    def test_tracker_config_retains_soft_band_and_exposes_limits(self):
+        from tracking.run_tracker import parse_args
+
+        with patch("sys.argv", ["run_tracker", "--probe"]):
+            args = parse_args()
+        self.assertTrue(args.tracking_safety)
+        self.assertTrue(args.visibility_prediction)
+        self.assertEqual((args.follow_band_min, args.follow_band_max), (5.0, 10.0))
+        self.assertEqual(args.acceleration_feedforward_gain, 0.0)
+        self.assertEqual(args.pitch_fov_compensation, 0.0)
+        with patch("sys.argv", ["run_tracker", "--probe", "--no-tracking-safety", "--no-visibility-prediction"]):
+            args = parse_args()
+        self.assertFalse(args.tracking_safety)
+        self.assertFalse(args.visibility_prediction)
+
+    def test_run_tracker_command_loop_has_no_undefined_names(self):
+        """实飞崩溃曾来自循环体里的未定义符号，静态检查必须挡住这一类。"""
+        import ast
+        import subprocess
+        import sys
+
+        from tracking import run_tracker
+
+        source = Path(run_tracker.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        loops = [node for node in ast.walk(tree) if isinstance(node, ast.While)]
+        command_loop = next(node for node in loops if "visibility_filter"
+                            in {name.id for name in ast.walk(node) if isinstance(name, ast.Name)})
+        imported = {alias.name for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
+                    for alias in node.names}
+        used = {name.id for name in ast.walk(command_loop) if isinstance(name, ast.Name)}
+        self.assertIn("TargetState", imported)
+        self.assertIn("TargetState", used)
+        completed = subprocess.run([sys.executable, "-m", "pyflakes", run_tracker.__file__],
+                                   capture_output=True, text=True, check=False)
+        self.assertEqual(completed.stdout.strip(), "", completed.stdout)
 
 
 class ControlLawTest(unittest.TestCase):

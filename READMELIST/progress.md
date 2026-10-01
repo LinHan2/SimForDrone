@@ -10,7 +10,7 @@
 | **px4ctrl 控制环** | **已落地并验证** | 唯一命令执行模块 `px4ctrl/`；姿态+推力闭环：最高 `1.974 m`、稳态误差均值 `0.023 m`、落地并上锁。证据 `logs/px4ctrl/hold-target-20260918-214430/`。 |
 | P2.1-T2：tracker 站位保持 | **已通过** | 稳态误差均值 `0.014 m`、最大 `0.020 m`（门槛 0.5 m）。证据 `logs/px4ctrl/hold-tracker-20260918-214228/`。 |
 | P2.2：多机共享坐标系 | **已实现并实测验证** | `GLOBAL_POSITION_INT` + 共用地理原点换算；与 ROS 真值同时刻对比偏差约 2 cm。 |
-| P2.3-T3：真值双机跟踪 | **已通过保守基准** | 2026-09-27 保守八字：target/tracker 均 `result=completed`、落地并上锁，`tilt_saturated_samples=0`；tracker `error_mean=0.0547 m`、`error_max=0.2114 m`、`cmd_ctrl_fraction=1.0`。修复显式 `completed` 终态后不再被误判状态超时。证据 `logs/tracking/tracker-v0-20260927-000447/`。 |
+| P2.3-T3：真值双机跟踪 | **保守基准已通过；5 m 跟随未验收** | 2026-09-27 保守八字：target/tracker 均 `result=completed`、落地并上锁，`tilt_saturated_samples=0`；tracker `error_mean=0.0547 m`、`error_max=0.2114 m`、`cmd_ctrl_fraction=1.0`。历史记录 `logs/tracking/tracker-v0-20260927-000447/`（本机当前未找到该目录）；后续 5 m 门控运行未放行 target，不能沿用此结论。 |
 | P3：姿态约束相对 EKF | **在线输入链已验证，待低速飞行验收** | `relative-ekf` 状态源已把 target PX4 EKF 姿态、目标共享位置量测与 tracker IMU 比力接入 9 维相对 EKF；安全 probe 已实际输出估计位置/速度/加速度，未解锁、未发送控制。控制参考采用 EKF 输出的位置/速度/加速度。当前量测位置仍来自仿真共享真值，尚未替换为 RGB-D 6D 网络输出。 |
 
 `vision/` 已建立为独立模块，但按阶段约束暂不接入控制；T3/T4 通过后再以视觉相对位姿替换
@@ -18,12 +18,48 @@
 
 ## 当前检查点
 
+### 2026-10-01：只读可见性预测与两轮完整复测
+
+- `tracking/visibility_prediction.py` 与 `tracking/visibility_diagnostics.py` 已接入可关闭的
+  只读旁路：双姿态假设下的未来图像像素、三维距离、预计出画和软代价写入
+  `run.json`，并导出 CSV/PNG。默认关闭；`--visibility-prediction` 只记录诊断，
+  **不参与** V0 参考或 PX4 控制。运行时 `CameraInfo` 焦距约 3054.16 px，
+  与场景 YAML 的 640 px 不符，已用显式静态快照仅覆盖旁路投影；
+  这不是实时标定或图像检测。飞前 `tracking/tests` 离线回归 **174 项通过**。
+- 两轮均使用新场景、真值基线门控、半径 1.5 m 的两圈圆轨迹，target 上限
+  $v=0.45\,\mathrm{m/s}$、$a=0.30\,\mathrm{m/s^2}$；target 与 tracker 均
+  PASS、落地上锁，倾角限幅样本为零。tracker 参考误差均值分别约 0.173 m、
+  0.173 m；这不是图像检测误差或因旁路预测而得到的控制改进。
+  第一轮 [tracker 日志](../logs/tracking/tracker-v0-20261001-030207/run.json)、
+  [shadow 观测图](../logs/tracking/shadow-relative-ekf-20261001-030418-observation.png)；
+  第二轮 [tracker 日志](../logs/tracking/tracker-v0-20261001-030828/run.json)、
+  [跟踪响应图](../logs/tracking/tracker-v0-20261001-030828/response.png) 与
+  [shadow 观测图](../logs/tracking/shadow-relative-ekf-20261001-031039-observation.png)。
+- shadow Oracle 的 FOV 样本分别为 1175、1229，均有效且未实际出画；
+  预测两种姿态假设也均未报出画。第二轮 Oracle u 为 526.2--632.7 px、
+  v 为 269.9--476.0 px（图像主点约 (640,360)）；目标偏中心左侧，不是
+  新增像素闭环锁定。第二轮水平距离最大约 10.068 m，轻微超过 10 m 软带上界。
+- 按预测时刻与 shadow 单调时钟最近邻配对、最大偏差 120 ms：
+  $0.2$ s 固定/指令姿态像素 RMSE，第一轮 47.67/52.92 px，第二轮
+  45.69/49.91 px；$0.5$ s 分别为 63.32/52.96 px、60.42/50.07 px。
+  收紧到 25 ms 后，$0.5$ s 分别为 63.18/52.76 px、59.86/49.61 px，
+  优势方向仍一致；$0.2$ s 则仍是固定姿态较好。零时距误差约 45.04/43.49 px；
+  数据只评价**几何投影相对 Oracle**，无出画事件，尚不能评价预警提前量。
+  [两轮对照图](../logs/tracking/visibility-repeat-comparison.png)、
+  [第二轮预测图](../logs/tracking/tracker-v0-20261001-030828/visibility_prediction.png)。
+- 随后的 0.60 m/s、0.40 m/s² 加速试验在航迹中被取消：
+  [门控日志](../logs/tracking/gated-7LCMPX/target.log) 仅覆盖已放行的初段，
+  **没有完整运行记录或 PASS，不能作为提速验收**；控制进程已退出，场景状态输出显示
+  双机落地静止。本次启动误用了 `--no-stream-ui`，关闭了 WebRTC 中的 HUD/状态栏；
+  下次使用可切换视角和状态信息的默认 UI 流启动方式，并遵照使用者要求不要每轮
+  自动重启仍健康的场景。因本次已结束，不继续试飞。
+
 ### 已具备
 
 - 场景、两套 PX4 SITL、WebRTC 与 ROS 2 观测接口已可运行；双机 dry-run、target 单机航点、
   自动降落与上锁均已验证。
 - `px4ctrl` 是唯一 MAVLink 控制出口；target 与 tracker 各自独占端口，目标状态经本机 UDP 转发。
-- 圆形、八字、螺旋轨迹、真值跟踪指标和响应图已实现；完整 `tracking/tests` 离线回归为 **87 项通过**，场景环境/光照配置回归为 **13 项通过**。
+- 圆形、八字、螺旋轨迹、真值跟踪指标和响应图已实现；最近一次完整 `tracking/tests` 离线回归为 **137 项通过**，场景环境/光照配置回归为 **13 项通过**。
 - 估计器影子内核 `tracking/relative_ekf.py` 已按 Airsim2box 已调参实现重构：状态为
   $x=[\delta p,\delta v,a_t,\alpha]^T$，使用 bearing-box 的 Lemma 1 归一化位置方向和目标推力方向 $h$。其姿态约束为
   $$(I-hh^T)a_t=(I-hh^T)(0,0,-9.81)^T,$$
@@ -31,12 +67,12 @@
 
 ### 最近双机动态结果
 
-- 2026-09-26 的八字试验中，target 完成轨迹并安全落地：
-  `logs/tracking/target-trajectory-20260926-230758/`。
-- tracker 成功起飞并进入跟踪，但后段发生持续倾角饱和，状态机转入 `AUTO_HOVER`；target 落地停止
-  状态发布后，tracker 以目标状态超时安全退出：
-  `logs/tracking/tracker-v0-20260926-230813/`。
-- 因此当前双机动态真值跟踪**没有通过验收**；不能据此开始视觉/EKF 或提高轨迹速度。
+- 2026-09-27 的保守八字已完成双机真值跟踪与安全落地，见上表；这只覆盖该低速基准。
+- 最近的 5 m 跟随门控记录 `logs/tracking/gated-TdDHcB/tracker.log` 中，tracker 已进入
+  Offboard：初始水平间距约 21.38 m，约 33 s 时缩至 10.1 m，约 66 s 时又增至 23.4 m。
+  因而并非“tracker 完全不动”；它接近后反向摆远，5 m 门控没有通过，target 没有获准执行轨迹。
+- 针对接近时大位置误差造成控制饱和的假设，5 m 跟随模式已加入 1 m 位置误差限幅，
+  默认真值引导不变；仅通过离线测试，**尚未证明能消除飞行振荡**。
 
 ### 当前限制
 
@@ -45,18 +81,21 @@
   低带宽阶跃验收，不能用于双机或真机。
 - `relative-ekf` 已进入 tracker 的可选控制通路，但位置量测仍来自 target 进程的共享 ENU 真值；它是姿态/IMU/EKF 的在线集成基线，不构成视觉闭环验收。
 - `vision/` 仍未实现 RGB-D 6D 位姿网络与相机外参链路；在它替换上述位置量测前，不能宣称视觉估计已接入控制。
+- 场景初始化已为 target/tracker 的 Iris 机身分别绑定橙色/青色 USD 材质；代码语法与场景离线回归通过，
+  但尚未启动场景核验实际渲染。离线 Isaac Python 无法导入 `pxr`，USD 材质绑定也尚未获得在线验证。
 
 ### 下一步
 
 0. **论文收敛**：全部新增实验按 [论文中心思想与实验收敛计划](paper_thesis.md) 的
    "4 组核心实验 + 3 个理论命题 + 1 个真实双机闭环"边界执行；不能支撑核心科学结论
    的实验不再列入计划。
-1. 使用比当前八字更保守的速度、加速度和半径，复飞无噪真值双机轨迹。
-2. 验收两端 `on_ground=true`、`disarmed=true`，tracker 的 `tilt_saturated_samples=0`，并检查
-   `cmd_ctrl_fraction`、动态误差和响应图。
-3. 修复 target 正常结束的终止事件与 tracker 指标收尾后，取得无饱和真值基准。
-4. 以 `--state-source relative-ekf` 先做短时低速影子/闭环仿真，检查估计误差、协方差、量测年龄与 `tilt_saturated_samples`；通过前不提高轨迹速度。
-5. 将 RGB-D 6D 网络输出的相对位置、完整姿态、协方差和时间戳替换当前仿真共享位置量测，再进行视觉闭环验收。
+1. 下次获准启动场景时确认双色机身实际可见，检查材质是否覆盖已有子网格材质且不影响机载相机。
+2. 在受控低速飞行中复测 5 m 跟随门控，核对水平距离、倾角饱和、两机落地上锁与响应图；
+  若仍摆远，继续分析控制/状态时序，不把离线限幅当成飞行验收。
+3. 在真值跟随与门控稳定之后，以 `--state-source relative-ekf` 做短时低速影子/闭环仿真，
+  检查估计误差、协方差、量测年龄与 `tilt_saturated_samples`；通过前不提高轨迹速度。
+4. 将 RGB-D 6D 网络输出的相对位置、完整姿态、协方差和时间戳替换当前仿真共享位置量测，
+  再进行视觉闭环验收。
 
 ### 相对 EKF 离线内核（2026-09-26）
 

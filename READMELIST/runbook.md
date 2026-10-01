@@ -22,36 +22,14 @@ cd /data/disk2/home/hl/research/SimForDrone
 这是实际渲染相机视口，不是 `Camera View (IBVS)` 的模拟投影窗口。
 画面可用于人工监看，但不会自动记录失视时长，也不能证明控制器保证持续可见。
 
-场景就绪后，在第二个终端运行唯一的飞行编排入口（会解锁两架飞机）：
+当前编排入口因尚未接入真实像素与深度闭环而拒绝解锁。以下仅记录待验证的
+低速参数组合，不是可执行的飞行步骤：
 
 ```bash
-cd /data/disk2/home/hl/research/SimForDrone
-./scripts/run_target_shadow_gated.sh --execute -- \
-	--trajectory circle --trajectory-radius 8 --trajectory-cycles 2 \
-	--max-speed 3.0 --max-accel 2.5
+./scripts/run_target_shadow_gated.sh --execute --truth-baseline -- \
+  --trajectory circle --trajectory-radius 10 --trajectory-cycles 2 \
+  --max-speed 5.0 --max-accel 3.0
 ```
-
-这是显式高速配置；默认仍为 0.25 m/s，不会自动提速。3 m 半径使圆周
-参考峰值超过 2 m/s 时所需加速度保持在 2.5 m/s² 以内；实际速度取决于
-控制器、跟踪误差和 PX4 状态，不保证一定超过 2 m/s。高速轨迹可能使目标
-离开机载视野，FOV 门只检查起点。任务结束后查看终端打印的 target
-`PLOT` 路径下的 `response.png`：右上角对比参考与实测速度和 2 m/s 线，
-其余子图检查轨迹、误差；tracker 也会输出自己的 `response.png`。
-
-脚本启动 target（MAVLink `14540`）悬停，再启动 truth tracker（`14541`）；
-tracker 进入跟踪且 Oracle FOV + RGB-D 深度连续 15 帧有效后，启动只读 shadow EKF，
-再放行 target 轨迹。无需手动切换多个控制终端。日志路径在终端打印，位于
-`logs/tracking/gated-*/`；结束时检查两机日志中的 `on_ground` 与 `disarmed`。
-按 `Ctrl-C` 会请求本次启动的两机安全降落；脚本不终止已有场景或其他实验进程。
-tracker 默认采用 20° 的组合倾角上限和 0.35 rad/s 的偏航参考限速（可通过
-`run_tracker.sh` 的 `--max-tilt-deg`、`--max-yaw-rate` 单独调整）；target 的控制参数不变。
-两项限制可减轻姿态突变，但不保证 target 在整个轨迹中保持可见。
-双机入口还会让 tracker 沿起飞时的水平视线以 0.5 m/s 渐进接近 5 m，
-高度差保持不变；`tracker.log` 的 `distance`/`desired` 分别为实际/期望水平间距。
-实际距离进入 5 ± 0.5 m 后才检查 FOV 并放行 target；超时不会放行。
-tracker 的 `response.png` 右上角展示实际/期望水平间距，配合误差图检查往复摆动。
-这不是机载图像闭环，也不能保证高速运动时图像不抖动或目标始终入镜。
-
 ## 边界与故障
 
 - 当前 tracker **仅用 truth 状态跟踪**；shadow 使用 target PX4 姿态与 tracker RGB-D，

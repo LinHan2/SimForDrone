@@ -8,6 +8,7 @@ import math
 import select
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 from px4ctrl.cli import apply_task_defaults, enter_offboard, finish, wait_ready
@@ -38,6 +39,8 @@ def parse_args() -> argparse.Namespace:
     mode.add_argument("--probe", action="store_true", help="仅检查 target 遥测与共享状态发布，不解锁")
     mode.add_argument("--execute", action="store_false", dest="probe", help="兼容旧命令；现在默认直接执行")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument("--horizontal-kp", type=float, default=None,
+                        help="仅覆盖本轮 target 的水平位置增益 Kp0/Kp1")
     parser.add_argument("--interactive", action="store_true", help="起飞后从终端非阻塞读取手动航点")
     parser.add_argument(
         "--trajectory",
@@ -73,9 +76,9 @@ def parse_args() -> argparse.Namespace:
         help="dry-run 持续发布 target 状态的时间（s）",
     )
     # 倾角预算必须覆盖完整控制量 Kp·位置误差 + Kv·速度误差 + 加速度前馈，不能只看
-    # 轨迹的加速度上限。25° 约为 4.6 m/s²；保守的 0.25/0.25 为反馈项留出余量。
-    parser.add_argument("--max-speed", type=float, default=0.25, help="航段最大速度（m/s）")
-    parser.add_argument("--max-accel", type=float, default=0.25, help="航段最大加速度（m/s²）")
+    # 轨迹的加速度上限。25° 约为 4.6 m/s²；保守的 0.20/0.15 为反馈项留出余量。
+    parser.add_argument("--max-speed", type=float, default=0.20, help="航段最大速度（m/s）")
+    parser.add_argument("--max-accel", type=float, default=0.15, help="航段最大加速度（m/s²）")
     parser.add_argument("--state-host", default=DEFAULT_STATE_HOST)
     parser.add_argument("--state-port", type=int, default=DEFAULT_STATE_PORT)
     parser.add_argument(
@@ -115,6 +118,7 @@ def publish_state(
             timestamp=now,
             attitude=link.odom.q,
             reference_acceleration=reference_acceleration,
+            attitude_timestamp=link.odom.attitude_recv_time or None,
         )
 
 
@@ -315,6 +319,8 @@ def main() -> int:
         raise ValueError("start-delay/dwell/final-hold 必须非负，其余等待时间和容差必须为正")
     if args.max_speed <= 0.0 or args.max_accel <= 0.0:
         raise ValueError("max-speed 与 max-accel 必须为正")
+    if args.horizontal_kp is not None and (not math.isfinite(args.horizontal_kp) or args.horizontal_kp <= 0.0):
+        raise ValueError("horizontal-kp 必须为正且有限")
     if args.trajectory is not None and (args.interactive or args.point):
         raise ValueError("--trajectory 不能与 --interactive 或 --point 同时使用")
     if args.trajectory_cycles <= 0 or args.trajectory_radius <= 0.0:
@@ -323,6 +329,8 @@ def main() -> int:
         raise ValueError("trajectory-vertical-amplitude 不得为负")
     points = args.point or [(0.0, 0.0, 2.0), (2.0, 0.0, 2.0), (0.0, 0.0, 2.0)]
     params = load_params(args.config)
+    if args.horizontal_kp is not None:
+        params = replace(params, gain=replace(params.gain, kp0=args.horizontal_kp, kp1=args.horizontal_kp))
     defaults = task_defaults(params)
     link = MavlinkLink(params.link, resolve_role("target"), shared_frame=params.shared_frame)
     fsm = PX4CtrlFSM(params, LinearControl(params), link, log=lambda message: print(f"[target] {message}"))
@@ -476,8 +484,8 @@ def main() -> int:
                     f"a≤{args.max_accel:.2f} m/s²）"
                 )
                 reached_at: float | None = None
-                # 截止时间 = 轨迹本身时长 + 充裕裕量，不再用固定 60 s 碰运气。
-                deadline = segment_started + segment.duration + 60.0
+                # 为到达半径内的停留判据预留时间。
+                deadline = segment_started + segment.duration + 90.0 + args.dwell
                 while time.monotonic() < deadline:
                     now = time.monotonic()
                     reference_p, reference_v, reference_a = segment.sample(now - segment_started)
@@ -526,7 +534,7 @@ def main() -> int:
                         reached_at = None
                     time.sleep(rate)
                 else:
-                    raise RuntimeError(f"target 未在 60s 内到达航点 {index}，最终误差 {error:.3f}m")
+                    raise RuntimeError(f"target 未在航段时长 + 90s + 停留时间内到达航点 {index}，最终误差 {error:.3f}m")
 
             print(f"末航点保持 {args.final_hold:.1f}s，继续发布 target 状态")
             deadline = time.monotonic() + args.final_hold

@@ -41,6 +41,21 @@ class RelativeTargetEstimate:
     scale: float
 
 
+@dataclass(frozen=True)
+class MetricTargetEstimate:
+    timestamp: float
+    relative_position: Vector3
+    relative_velocity: Vector3
+    target_acceleration: Vector3
+
+
+@dataclass(frozen=True)
+class MetricPoseMeasurement:
+    timestamp: float
+    relative_position: Vector3 | None
+    target_thrust_direction: Vector3 | None
+
+
 class RelativeTargetEKF:
     """按论文式 (34)、(39) 融合 bearing-box 与姿态-加速度约束。
 
@@ -323,3 +338,112 @@ class RelativeTargetEKF:
         first /= float(np.linalg.norm(first))
         second = np.cross(thrust_direction, first)
         return np.column_stack((first, second))
+
+
+class MetricRelativeTargetEKF(RelativeTargetEKF):
+    """九维米制相对位置、速度和目标加速度滤波器。"""
+
+    def __init__(
+        self,
+        position_std: float = 0.102,
+        attitude_constraint_std: float = 0.03,
+        position_process_std: float = 0.002,
+        velocity_process_std: float = 0.1095445115,
+        acceleration_process_std: float = 0.2449489743,
+        fading: float = 1.001,
+        tilt_direction_std: float | None = None,
+    ) -> None:
+        super().__init__(position_std, attitude_constraint_std, position_process_std,
+                         velocity_process_std, acceleration_process_std, fading=fading,
+                         tilt_direction_std=tilt_direction_std)
+        self._x = np.zeros(9, dtype=np.float64)
+        self._P = np.eye(9, dtype=np.float64) * 10.0
+
+    @property
+    def tuning(self) -> dict[str, float | None]:
+        return {key: value for key, value in super().tuning.items()
+                if key not in ("scale_process_std_m", "stereo_range_std_m")}
+
+    def initialize(self, relative_position: Vector3, relative_velocity: Vector3 = (0.0, 0.0, 0.0)) -> None:
+        self._x[:3] = self._vector(relative_position, "relative_position")
+        self._x[3:6] = self._vector(relative_velocity, "relative_velocity")
+        self._x[6:9] = 0.0
+        self._P = np.eye(9, dtype=np.float64) * 10.0
+        self._timestamp = None
+
+    def update(
+        self, measurement: MetricPoseMeasurement, observer_acceleration: Vector3
+    ) -> MetricTargetEstimate:
+        # x = [delta_p, delta_v, a_target] (共享 ENU), delta_p = p_target - p_tracker。
+        # 可用时分别融合 z_p = delta_p + noise 和 B(h)^T a_target = B(h)^T g；
+        # B(h) 是目标推力方向 h 的正交切空间基，缺失的量测跳过对应更新。
+        position = (None if measurement.relative_position is None else
+                    self._vector(measurement.relative_position, "relative_position"))
+        thrust = (None if measurement.target_thrust_direction is None else
+                  self._unit_vector(measurement.target_thrust_direction, "target_thrust_direction"))
+        acceleration = self._vector(observer_acceleration, "observer_acceleration")
+        if not np.isfinite(measurement.timestamp):
+            raise ValueError("timestamp 必须为有限数")
+        if self._timestamp is None:
+            if position is None:
+                raise ValueError("首帧需要有效米制相对位置")
+            self.initialize((float(position[0]), float(position[1]), float(position[2])))
+        else:
+            dt = measurement.timestamp - self._timestamp
+            if dt <= 0.0:
+                raise ValueError("timestamp 必须严格递增")
+            self._predict(dt, acceleration)
+        if position is not None:
+            observation = np.zeros((3, 9))
+            observation[:, :3] = np.eye(3)
+            self._kalman_update(observation, position, np.eye(3) * self._position_variance)
+        if thrust is not None:
+            basis = self._tangent_basis(thrust)
+            observation = np.zeros((2, 9))
+            observation[:, 6:9] = basis.T
+            self._kalman_update(observation, basis.T @ _GRAVITY_ENU, self._tilt_measurement_noise())
+        self._sanitize_covariance()
+        self._clamp_state()
+        self._timestamp = measurement.timestamp
+        return MetricTargetEstimate(
+            timestamp=measurement.timestamp,
+            relative_position=(float(self._x[0]), float(self._x[1]), float(self._x[2])),
+            relative_velocity=(float(self._x[3]), float(self._x[4]), float(self._x[5])),
+            target_acceleration=(float(self._x[6]), float(self._x[7]), float(self._x[8])),
+        )
+
+    def _kalman_update(self, observation: np.ndarray, value: np.ndarray, noise: np.ndarray) -> None:
+        # y = z - H x, S = H P H^T + R, K = P H^T S^-1；
+        # x+ = x + K y, P+ = (I-KH) P (I-KH)^T + K R K^T (Joseph 形式)。
+        innovation = value - observation @ self._x
+        covariance = observation @ self._P @ observation.T + noise
+        gain = np.linalg.solve(covariance, observation @ self._P).T
+        self._x += gain @ innovation
+        residual = np.eye(9) - gain @ observation
+        self._P = residual @ self._P @ residual.T + gain @ noise @ gain.T
+
+    def _clamp_state(self) -> None:
+        for block, limit in ((slice(0, 3), self._max_rel_dist),
+                             (slice(3, 6), self._max_rel_speed),
+                             (slice(6, 9), self._max_target_acc)):
+            norm = float(np.linalg.norm(self._x[block]))
+            if norm > limit:
+                self._x[block] *= limit / norm
+
+    def _predict(self, dt: float, observer_acceleration: np.ndarray) -> None:
+        # a_rel = a_target - a_tracker, delta_p+ = delta_p + delta_v dt + a_rel dt^2/2,
+        # delta_v+ = delta_v + a_rel dt, a_target+ = a_target；P+ = lambda(F P F^T + Q)。
+        # F 的 p-v、p-a、v-a 块分别是 dt I、dt^2 I/2、dt I。
+        relative_acceleration = self._x[6:9] - observer_acceleration
+        self._x[:3] += self._x[3:6] * dt + 0.5 * relative_acceleration * dt**2
+        self._x[3:6] += relative_acceleration * dt
+        transition = np.eye(9)
+        transition[:3, 3:6] = np.eye(3) * dt
+        transition[:3, 6:9] = np.eye(3) * (0.5 * dt**2)
+        transition[3:6, 6:9] = np.eye(3) * dt
+        noise = np.diag([self._position_process_variance] * 3
+                        + [self._velocity_process_variance] * 3
+                        + [self._acceleration_process_variance] * 3)
+        self._P = (transition @ self._P @ transition.T + noise) * self._fading
+        self._sanitize_covariance()
+        self._clamp_state()

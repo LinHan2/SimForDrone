@@ -30,8 +30,8 @@ class TargetWaypointTest(unittest.TestCase):
         with patch("sys.argv", ["target_waypoints.py"]):
             args = parse_args()
 
-        self.assertEqual(args.max_speed, 0.25)
-        self.assertEqual(args.max_accel, 0.25)
+        self.assertEqual(args.max_speed, 0.20)
+        self.assertEqual(args.max_accel, 0.15)
 
     def test_trajectory_arguments_are_parsed(self) -> None:
         with patch("sys.argv", ["target_waypoints.py", "--trajectory", "figure8", "--trajectory-cycles", "2"]):

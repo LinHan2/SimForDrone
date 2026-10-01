@@ -1,0 +1,142 @@
+# 跟踪进程默认参数；显式命令行选项覆盖 tracker 段的同名字段。
+# 路径相对 SimForDrone 根目录。PX4Ctrl 的位置/速度增益仍在 px4ctrl/config/sim.yaml。
+# 注意：PBVS 仅用于影子记录与离线模拟；当前实际下发的是 V0 位置参考。
+tracker:
+  # true 仅检查遥测/目标状态，不解锁；false 允许进入原有执行流程。
+  probe: false
+  # 底层位置控制器、推力模型及 FSM 的配置文件。
+  config: px4ctrl/config/sim.yaml
+  # 跟踪段持续时间 [s]；0 表示持续到中断或目标状态结束。
+  duration: 30.0
+  # V0 期望站位 = 目标共享 ENU 位置 + (east, north, up) [m]；
+  # 三项全为 null 时在跟踪开始时锁存实际相对位置。
+  offset_east: null
+  offset_north: null
+  offset_up: null
+  # 软约束带 [m]：水平间距在 [min, max] 内不做径向牵引，越界才拉回边界。
+  # 取代旧的固定 follow_distance，避免目标机动时被持续拉回单一距离而超调。
+  follow_band_min: 5.0
+  follow_band_max: 10.0
+  # 上式中站位半径最大变化率 [m/s]，不是飞机实际速度上限。
+  approach_speed: 0.15
+  # 跟随时目标相对高度 [m]；从锁存高度差按下方速度平滑靠近，留出相机下边界空间。
+  follow_height_offset: 0.075
+  # 高度参考相对目标的最大变化速度 [m/s]，避免瞬时高度设定点跳变。
+  follow_height_speed: 0.05
+  # 限幅共享 ENU 位置误差 [m]：
+  # e = p_target + offset - p_tracker；p_ref_local = p_odom + e * min(1, limit/|e|)。
+  max_position_error: 0.4
+  # 水平位置修正对应的最大速度 [m/s]；只限制修正项，不限制目标速度前馈或高度。
+  max_correction_speed: 0.2
+  # 只覆盖 tracker 水平位置环 Kp0/Kp1；保留速度阻尼 Kv0/Kv1 与 target 原参数。
+  horizontal_kp: 0.8
+  # 保留软距离带；仅 CMD_CTRL 限制完整控制量，不限制 target 轨迹。
+  tracking_safety: true
+  tracking_horizontal_accel: 1.5
+  tracking_vertical_accel_min: -0.8
+  tracking_vertical_accel_max: 0.8
+  tracking_jerk: 3.0
+  tracking_max_dt: 0.1
+  # 初始只用位置/速度反馈；后续可单独测试 0.2、0.5、1.0。
+  acceleration_feedforward_gain: 0.0
+  # 时间加权的当前几何视野验收；缺测不得算可见，不作为姿态反馈。
+  fov_central_margin: 0.7
+  fov_min_coverage: 0.95
+  fov_min_central_fraction: 0.9
+  fov_max_loss_fraction: 0.0
+  fov_max_gap: 0.2
+  # true 计算并记录 PBVS 候选速度；绝不将其送入 FSM/飞控。
+  pbvs_shadow: false
+  visibility_prediction: true
+  # V0 构造时的 yaw 字段 [rad]；当前 generate() 实际按目标方向 atan2(dN,dE)
+  # 生成偏航，故此字段目前不会覆盖动态偏航。
+  yaw: 0.0
+  # 跟踪进程创建 PX4Ctrl 时的最大倾角 [deg]；越小越容易发生倾角限幅。
+  max_tilt_deg: 10.0
+  # 按上一周期指令俯仰调整高度参考的上限 [m]；新基线关闭该耦合。
+  # 限幅与只读 FOV 监控不保证目标永不出画，需独立进行飞行验收。
+  pitch_fov_compensation: 0.0
+  # 偏航参考变化率上限 [rad/s]：|yaw_cmd[k]-yaw_cmd[k-1]| <= rate*dt。
+  max_yaw_rate: 0.2
+  # 目标状态源：truth=共享真值；estimator=带噪透传；
+  # relative-ekf=合成相对位置量测 + 目标姿态约束 EKF，尚非真实视觉输入。
+  state_source: estimator
+  # estimator 透传路径的位置/速度独立高斯噪声标准差 [m], [m/s]。
+  position_noise_std: 0.05
+  velocity_noise_std: 0.02
+  # 合成噪声的随机种子（整数），便于重现。
+  noise_seed: 0
+  # relative-ekf 合成位置量测噪声标准差 [m]；0 表示无注入噪声。
+  relative_measurement_position_std: 0.0
+  # 每次新目标报文丢弃合成量测的概率 [0,1]。
+  relative_measurement_dropout_probability: 0.0
+  # EKF 位置量测噪声 R 的标准差 [m]（协方差约为 std^2）。
+  relative_ekf_position_std: 0.102
+  # EKF 姿态-加速度约束噪声标准差 [m/s^2]。
+  relative_ekf_attitude_constraint_std: 0.03
+  # EKF 每步过程噪声 Q 的标准差，依次为位置 [m]、速度 [m/s]、
+  # 加速度 [m/s^2]；各对应方差为 std^2。
+  relative_ekf_position_process_std: 0.002
+  relative_ekf_velocity_process_std: 0.1095445115
+  relative_ekf_acceleration_process_std: 0.2449489743
+  # EKF 协方差遗忘系数 lambda >= 1；增大使过去信息衰减更快。
+  relative_ekf_fading: 1.001
+  # 在 AUTO_HOVER 中预热 relative-ekf 后才进入 CMD_CTRL [s]。
+  relative_ekf_warmup_seconds: 8.0
+  # 目标状态最大允许年龄 [s]；超时触发原有退出/收尾逻辑。
+  state_timeout: 0.5
+  # 误差统计跳过跟踪开始后的这段时间 [s]；不改变控制输出。
+  settling_seconds: 5.0
+  # TRACK 文本状态打印周期 [s]；0 关闭打印，不影响采样。
+  status_period: 1.0
+  # target 状态广播监听地址和 UDP 端口；须与 target 发布端一致。
+  state_host: 127.0.0.1
+  state_port: 14600
+  # 本轮 run.json、图表的输出目录。
+  output_root: logs/tracking
+
+visibility_prediction:
+  camera_config: configs/dual_uav_outdoor.yaml
+  # 本轮从机载相机 CameraInfo 读取的静态快照；场景 YAML 的 fx/fy=640 与运行时不符。
+  # 若重启/更换相机，请重新核对 CameraInfo；该覆盖仅用于旁路预测。
+  camera_intrinsics_override: [[3054.16357421875, 0.0, 640.0], [0.0, 3054.16357421875, 360.0], [0.0, 0.0, 1.0]]
+  prediction_horizon_sec: 0.8
+  prediction_dt: 0.05
+  translation_mode: constant_acceleration
+  attitude_mode: command_based_attitude
+  max_input_age_sec: 0.2
+  fov_safe_ratio: 0.6
+  fov_warning_ratio: 0.8
+  distance_min: 5.0
+  distance_max: 10.0
+  fov_weight: 1.0
+  distance_min_weight: 1.0
+  distance_max_weight: 1.0
+
+# Airsim2box RelativeTrackingController 的候选控制量，只在 pbvs_shadow=true 时
+# 用于日志；离线 simulate_px4 也从这里读取，绝非已验证可飞的增益。
+# 水平几何：dp = p_target - p_tracker，dv = v_target - v_tracker，
+# D = |dp_xy|，u = dp_xy/D，v_rel = dot(dv_xy,u)。高度由原 V0 负责。
+pbvs_shadow:
+  # 径向速度 v_rad = kp*e_D + ki_rad*I + kd*v_rel [m/s]。
+  # e_D 为距离误差 [m]，I 为误差积分 [m*s]；均仅用于影子结果。
+  kp: 0.5
+  kd: 0.7
+  ki_rad: 0.03
+  # 径向积分状态限幅 |I| <= i_rad_limit [m*s]，防止积分累积过大。
+  i_rad_limit: 1.2
+  # 标称跟随距离 [m]；距离带内 e_D = D - follow_dist。
+  follow_dist: 5.0
+  # 距离带边界 [m]：D<min 时 e_D=D-min；D>max 时 e_D=D-max。
+  min_follow_dist: 4.0
+  max_follow_dist: 6.2
+  # 切向相对速度系数（无量纲）：v_tan = dv_xy - v_rel*u；
+  # 目标绝对速度前馈系数（无量纲），近距离时还乘以衰减系数。
+  kv_tan: 0.40
+  kv_ff_abs: 0.20
+  # 候选速度模长上限 [m/s]；实际 V0/PX4 速度限制不由此项决定。
+  max_speed: 5.0
+  # 候选速度变化率上限 [m/s^2]：|v_cmd[k]-v_cmd[k-1]| <= max_accel*dt。
+  max_accel: 3.2
+  # 一阶离散滤波系数 (0,1]：v_smooth = alpha*v_raw + (1-alpha)*v_prev。
+  lpf_alpha: 0.76

@@ -29,7 +29,7 @@ observer_camera:
 
 viewport:
   # 俯视整个场景
-  position: [0.0, -30.0, 15.0]
+  position: [0.0, -20.0, 10.0]
   target: [0.0, 0.0, 2.0]
 
 environment:

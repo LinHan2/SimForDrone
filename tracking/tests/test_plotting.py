@@ -4,7 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from px4ctrl.plotting import _plot_target_response, _plot_tracker_response, _target_samples, write_response_plot, write_tracker_estimation_plots
+from px4ctrl.plotting import _plot_target_response, _plot_tracker_response, _plot_tracker_trajectory_3d, _target_samples, write_response_plot, write_tracker_estimation_plots
+from tracking.shadow_plotting import _plot_nine_state_response, plot_observation
 
 
 class ResponsePlotTest(unittest.TestCase):
@@ -195,8 +196,7 @@ class ResponsePlotTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             output_dir = Path(directory) / "tracking-run"
             paths = write_tracker_estimation_plots(output_dir, record)
-            # 9 张单轴估计图 + 3 张跟踪器图。
-            self.assertEqual(len(paths), 12)
+            self.assertEqual(len(paths), 13)
             for path in paths:
                 self.assertTrue(path.is_file(), str(path))
                 self.assertGreater(path.stat().st_size, 0, str(path))
@@ -204,6 +204,7 @@ class ResponsePlotTest(unittest.TestCase):
                 for axis in ("east", "north", "up"):
                     self.assertTrue((output_dir / "figures" / f"{quantity}_{axis}.png").is_file())
             for name in (
+                "tracker_trajectory_3d.png",
                 "tracker_horizontal_trajectory.png",
                 "tracker_position_tracking.png",
                 "tracker_error.png",
@@ -215,7 +216,69 @@ class ResponsePlotTest(unittest.TestCase):
                 sample["target_an"] = float("nan")
                 sample["target_au"] = float("nan")
             record["target_samples"] = record["samples"]
-            self.assertEqual(len(write_tracker_estimation_plots(output_dir, record)), 12)
+            self.assertEqual(len(write_tracker_estimation_plots(output_dir, record)), 13)
+
+    def test_3d_trajectory_keeps_enu_altitude_and_distinct_streams(self) -> None:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plot
+
+        samples = [{"tracker_e": -5.0, "tracker_n": 0.0, "tracker_u": 2.0,
+                    "desired_e": -4.9, "desired_n": 0.1, "desired_u": 2.1}]
+        target_samples = [{"target_e": 5.0, "target_n": 0.0, "target_u": 2.05},
+                          {"target_e": 5.1, "target_n": 0.2, "target_u": 2.06}]
+        figure = _plot_tracker_trajectory_3d(plot, samples, target_samples)
+        try:
+            axis = figure.axes[0]
+            self.assertEqual(axis.name, "3d")
+            self.assertEqual(axis.get_zlabel(), "Z / Up (m)")
+            self.assertEqual(list(axis.lines[0].get_data_3d()[2]), [2.05, 2.06])
+            self.assertEqual(list(axis.lines[1].get_data_3d()[2]), [2.0])
+            self.assertEqual(list(axis.lines[2].get_data_3d()[2]), [2.1])
+            self.assertLessEqual(axis.get_zlim()[0], 2.0)
+            self.assertGreaterEqual(axis.get_zlim()[1], 2.1)
+        finally:
+            plot.close(figure)
+
+    def test_shadow_nine_state_axes_preserve_missing_values_and_gaps(self) -> None:
+        import matplotlib
+        import math
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plot
+
+        record = {"samples": [
+            {"t": timestamp, "position_error_m": 0.1,
+             "measurement_relative_position": [9.9, 0.0, 0.1],
+             "truth": {"relative_position": [10.0, 0.0, 0.1],
+                       "relative_velocity": None if timestamp == 2.0 else [0.1, 0.2, 0.3],
+                       "target_acceleration": None},
+             "estimate": {"relative_position": [9.9, 0.0, 0.1],
+                          "relative_velocity": [0.4, 0.5, 0.6],
+                          "target_acceleration": [0.7, 0.8, 0.9]}}
+            for timestamp in (2.0, 2.1, 3.0)
+        ]}
+        figure = _plot_nine_state_response(plot, record)
+        try:
+            self.assertEqual(len(figure.axes), 9)
+            self.assertIn("Z / Up", figure.axes[2].get_title())
+            self.assertEqual(list(figure.axes[0].lines[0].get_xdata()), [2.0, 2.1])
+            self.assertEqual(list(figure.axes[0].lines[1].get_xdata()), [3.0])
+            self.assertTrue(math.isnan(figure.axes[3].lines[0].get_ydata()[0]))
+            self.assertEqual(figure.axes[3].lines[0].get_ydata()[1], 0.1)
+            self.assertTrue(all(math.isnan(value) for value in figure.axes[6].lines[0].get_ydata()))
+            self.assertEqual(list(figure.axes[8].lines[2].get_ydata()), [0.9, 0.9])
+            self.assertIn("proxy", figure.axes[3].lines[0].get_label())
+        finally:
+            plot.close(figure)
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "shadow-observation.png"
+            plot_observation(record, output)
+            self.assertTrue(output.is_file())
+            self.assertGreater(output.with_name("shadow-kinematics.png").stat().st_size, 0)
+        with self.assertRaises(ValueError):
+            _plot_nine_state_response(plot, {"samples": []})
 
     def test_unique_target_stream_overrides_held_control_samples(self) -> None:
         held_control_samples = [{"t": 0.0, "target_e": 1.0}, {"t": 0.2, "target_e": 1.0}]

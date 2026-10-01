@@ -2,6 +2,7 @@
 
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from pymavlink import mavutil
 
@@ -23,6 +24,23 @@ class FakeHighresImu:
     @staticmethod
     def get_type() -> str:
         return "HIGHRES_IMU"
+
+
+class FakeAttitude:
+    q1, q2, q3, q4 = 1.0, 0.0, 0.0, 0.0
+
+    @staticmethod
+    def get_type() -> str:
+        return "ATTITUDE_QUATERNION"
+
+
+class FakeLocalPosition:
+    x, y, z = 1.0, 2.0, -3.0
+    vx, vy, vz = 0.0, 0.0, 0.0
+
+    @staticmethod
+    def get_type() -> str:
+        return "LOCAL_POSITION_NED"
 
 
 class FakeConnection:
@@ -59,6 +77,15 @@ class MavlinkInputTest(unittest.TestCase):
         self.assertEqual(link.imu.acc, (1.0, -2.0, -3.0))
         self.assertEqual(link.imu.w, (0.4, 0.5, -0.6))
         self.assertGreater(link.imu.recv_time, 0.0)
+
+    def test_position_packet_does_not_refresh_attitude_timestamp(self) -> None:
+        params = load_params(SIM_CONFIG)
+        link = MavlinkLink(params.link, resolve_role("target"), log=lambda _: None)
+        link.connection = FakeConnection([FakeAttitude(), FakeLocalPosition()])
+        with patch("px4ctrl.link.time.monotonic", side_effect=[1.0, 2.0]):
+            link.pump()
+        self.assertEqual(link.odom.attitude_recv_time, 1.0)
+        self.assertEqual(link.odom.recv_time, 2.0)
 
     def test_command_rejection_preserves_mavlink_result_for_retry_policy(self) -> None:
         params = load_params(SIM_CONFIG)
