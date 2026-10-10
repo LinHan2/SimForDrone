@@ -75,6 +75,7 @@ class OdomData(Stamped):
     q: Quaternion = (0.0, 0.0, 0.0, 1.0)
     v: Vector3 = (0.0, 0.0, 0.0)
     attitude_recv_time: float = 0.0
+    source_time: float | None = None
 
 
 @dataclass

@@ -5,10 +5,30 @@ import unittest
 from pathlib import Path
 
 from px4ctrl.plotting import _plot_target_response, _plot_tracker_response, _plot_tracker_trajectory_3d, _target_samples, write_response_plot, write_tracker_estimation_plots
-from tracking.shadow_plotting import _plot_nine_state_response, plot_observation
+from tracking.shadow_plotting import _plot_nine_state_response, plot_observation, plot_tracker_nine_state
 
 
 class ResponsePlotTest(unittest.TestCase):
+    def test_tracker_nine_state_plot_is_written(self) -> None:
+        samples = [
+            {"t": 0.0, "relative_position": (5.0, 0.0, 0.0),
+             "estimated_relative_position": (4.9, 0.1, 0.0),
+             "relative_velocity": (0.0, 1.0, 0.0),
+             "estimated_relative_velocity": (0.1, 0.9, 0.0),
+             "target_a": (0.0, 0.5, 0.0), "estimated_target_acceleration": (0.0, 0.4, 0.0)},
+            {"t": 0.1, "relative_position": (5.0, 0.1, 0.0),
+             "estimated_relative_position": (5.0, 0.1, 0.0),
+             "relative_velocity": (0.0, 1.0, 0.0),
+             "estimated_relative_velocity": (0.0, 1.0, 0.0),
+             "target_a": (0.0, 0.5, 0.0), "estimated_target_acceleration": (0.0, 0.5, 0.0)},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "nine_state_response.png"
+            result = plot_tracker_nine_state(samples, output, "estimator")
+            self.assertEqual(result, output)
+            self.assertTrue(output.is_file())
+            self.assertGreater(output.stat().st_size, 0)
+
     def test_step_response_plot_is_written(self) -> None:
         record = {
             "task": "step-response",

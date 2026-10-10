@@ -16,6 +16,175 @@ from tracking.shadow_observation import (
 
 
 class ShadowObservationGeometryTest(unittest.TestCase):
+    def test_pixel_bridge_interrupt_cleanup_is_idempotent(self) -> None:
+        import sys
+        from unittest.mock import Mock, patch
+        try:
+            from utils import bridge_target_pixel
+        except ImportError as error:
+            self.skipTest(f"System ROS environment required: {error}")
+        node = Mock()
+        with patch.object(sys, "argv", ["bridge"]), \
+                patch.object(bridge_target_pixel, "TargetPixelBridge", return_value=node), \
+                patch.object(bridge_target_pixel.rclpy, "init"), \
+                patch.object(bridge_target_pixel.rclpy, "spin", side_effect=KeyboardInterrupt), \
+                patch.object(bridge_target_pixel.rclpy, "try_shutdown") as shutdown:
+            bridge_target_pixel.main()
+        node.socket.close.assert_called_once()
+        node.destroy_node.assert_called_once()
+        shutdown.assert_called_once()
+
+    def test_pixel_bridge_mixed_clocks_and_stale_inputs(self) -> None:
+        from unittest.mock import Mock, patch
+        try:
+            import rclpy
+            from geometry_msgs.msg import PoseStamped
+            from sensor_msgs.msg import CameraInfo, Image
+            from utils.bridge_target_pixel import TargetPixelBridge
+        except ImportError as error:
+            self.skipTest(f"System ROS environment required: {error}")
+        import json
+
+        rclpy.init()
+        node = TargetPixelBridge(14602)
+        node.socket.close()
+        node.socket = Mock()
+        try:
+            with patch("utils.bridge_target_pixel.time.monotonic", return_value=10.0):
+                info = CameraInfo()
+                info.width, info.height = 1280, 720
+                info.k = [921., 0., 640., 0., 921., 360., 0., 0., 1.]
+                node.on_info(info)
+                tracker = PoseStamped()
+                tracker.pose.orientation.w = 1.
+                tracker.header.stamp.sec = 1791560000
+                node.on_tracker_pose(tracker)
+                target = PoseStamped()
+                target.pose.position.x = 5.3
+                target.header.stamp.sec = 1791560000
+                node.on_target_pose(target)
+                rgb = Image()
+                rgb.header.stamp.sec = 449
+                rgb.width, rgb.height, rgb.encoding, rgb.step = 1280, 720, "rgb8", 3840
+                colors = np.zeros((720, 1280, 3), dtype=np.uint8)
+                colors[350:370, 630:650] = 255
+                rgb.data = colors.tobytes()
+                node.on_rgb(rgb)
+                depth = Image()
+                depth.header.stamp.sec = 449
+                depth.width, depth.height, depth.encoding, depth.step = 1280, 720, "32FC1", 5120
+                values = np.full((720, 1280), 20., dtype=np.float32)
+                values[350:370, 630:650] = 5.
+                depth.data = values.tobytes()
+                node.on_depth(depth)
+                node.socket.sendto.assert_called_once()
+                packet = json.loads(node.socket.sendto.call_args.args[0])
+                self.assertEqual(packet["source"], "rgbd_detection")
+                np.testing.assert_allclose(packet["pixel"], (639.5, 359.5), atol=1.)
+                node.socket.sendto.reset_mock()
+                node.target_pose_received_at = 9.7
+                node.on_depth(depth)
+                self.assertEqual(node.rejections["stale_input_arrival"], 1)
+                node.on_target_pose(target)
+                depth.header.stamp.sec = 450
+                node.on_depth(depth)
+                self.assertEqual(node.rejections["rgb_depth_stamp_skew"], 1)
+                depth.header.stamp.sec = 449
+                target.header.stamp.sec -= 1
+                node.on_depth(depth)
+                self.assertEqual(node.rejections["pose_stamp_skew"], 1)
+                node.socket.sendto.assert_not_called()
+        finally:
+            node.socket.close()
+            node.destroy_node()
+            rclpy.try_shutdown()
+
+    def test_rgbd_shadow_tangent_update_with_mixed_clock_inputs(self) -> None:
+        import sys
+        import time
+        from unittest.mock import Mock, patch
+        try:
+            import rclpy
+            from geometry_msgs.msg import AccelStamped, PoseStamped, TwistStamped
+            from sensor_msgs.msg import Image, Imu
+            from utils.shadow_relative_ekf import ShadowRelativeEkf, parse_args
+        except ImportError as error:
+            self.skipTest(f"System ROS environment required: {error}")
+        from tracking.state_io import StampedTargetState
+
+        with patch.object(sys, "argv", ["shadow", "--state-port", "0"]):
+            args = parse_args()
+        rclpy.init()
+        node = ShadowRelativeEkf(args)
+        try:
+            node.camera_matrix = np.array(((640., 0., 640.), (0., 640., 360.), (0., 0., 1.)))
+            tracker = PoseStamped()
+            tracker.pose.orientation.w = 1.
+            tracker.header.stamp.sec = 1791560000
+            node.on_tracker_pose(tracker)
+            target = PoseStamped()
+            target.pose.orientation.w = 1.
+            target.pose.position.x = 5.3
+            target.header.stamp.sec = 1791560000
+            node.on_target_pose(target)
+            for quantity, speed in (("observer_velocity", 2.), ("target_velocity", 6.)):
+                velocity = TwistStamped()
+                velocity.header.stamp.sec = 1791560000
+                velocity.header.frame_id = "map"
+                velocity.twist.linear.x = speed
+                node.on_gt(quantity, velocity)
+            acceleration = AccelStamped()
+            acceleration.header.stamp.sec = 1791560000
+            acceleration.header.frame_id = "map"
+            acceleration.accel.linear.y = 3.
+            node.on_gt("target_acceleration", acceleration)
+            imu = Imu()
+            imu.header.stamp.sec = 1791560000
+            imu.linear_acceleration.z = -9.81
+            node.on_imu(imu)
+            rgb = Image()
+            rgb.header.stamp.sec = 449
+            rgb.width, rgb.height, rgb.encoding, rgb.step = 1280, 720, "rgb8", 3840
+            colors = np.zeros((720, 1280, 3), dtype=np.uint8)
+            colors[350:370, 630:650] = 255
+            rgb.data = colors.tobytes()
+            node.on_rgb(rgb)
+            depth = Image()
+            depth.header.stamp.sec = 449
+            depth.width, depth.height, depth.encoding, depth.step = 1280, 720, "32FC1", 5120
+            values = np.full((720, 1280), 20., dtype=np.float32)
+            values[350:370, 630:650] = 5.
+            depth.data = values.tobytes()
+            node.subscriber.poll = Mock()
+            node.subscriber.latest = StampedTargetState(
+                time.monotonic(), 1, (5.3, 0., 0.), (0., 0., 0.),
+                q=(0., 0., 0., 1.), attitude_timestamp=time.monotonic())
+            with patch.object(node.filter, "_kalman_update", wraps=node.filter._kalman_update) as update:
+                node.on_depth(depth)
+                self.assertEqual(len(node.samples), 1, node.rejections)
+                self.assertEqual([call.args[0].shape for call in update.call_args_list], [(3, 9), (2, 9)])
+            np.testing.assert_allclose(node.samples[0]["observer_acceleration"], (0., 0., 0.), atol=1e-10)
+            self.assertEqual(node.samples[0]["optical_depth_m"], 5.)
+            np.testing.assert_allclose(node.samples[0]["truth"]["relative_velocity"], (4., 0., 0.))
+            np.testing.assert_allclose(node.samples[0]["truth"]["target_acceleration"], (0., 3., 0.))
+            node.gt_messages.clear()
+            velocity_gt, acceleration_gt, _ = node.truth_kinematics(time.monotonic())
+            self.assertIsNone(velocity_gt)
+            self.assertIsNone(acceleration_gt)
+            acceleration.header.stamp.sec -= 1
+            node.on_gt("target_acceleration", acceleration)
+            self.assertIsNone(node.truth_kinematics(time.monotonic())[1])
+            acceleration.header.stamp.sec += 1
+            acceleration.header.frame_id = "base_link"
+            node.on_gt("target_acceleration", acceleration)
+            self.assertIsNone(node.truth_kinematics(time.monotonic())[1])
+            node.on_depth(depth)
+            self.assertEqual(len(node.samples), 1)
+            self.assertEqual(node.rejections["nonincreasing_image_stamp"], 1)
+        finally:
+            node.close()
+            rclpy.try_shutdown()
+
     def test_observation_time_skew_uses_monotonic_arrivals(self) -> None:
         self.assertAlmostEqual(observation_time_skew(10.1, 10.0, 10.04, 10.08), 0.1)
         self.assertGreater(observation_time_skew(10.3, 10.0, 10.04, 10.08), 0.15)

@@ -100,9 +100,26 @@ class TargetState:
     a: Vector3 = (0.0, 0.0, 0.0)
 
 
+def visibility_intervention_weight(max_image_error: float | None, safe_ratio: float,
+                                  warning_ratio: float) -> float:
+    """把预测时域内的归一化图像偏差映射成 [0,1] 干预权重。
+
+    ``max_image_error`` 即 predictor 的 ``max(|u_n|,|v_n|)`` 时域最大值；它为 ``None``
+    表示预测窗内存在不可投影帧（相机后方/近像平面），属最危险情形，取 1。
+    """
+
+    if not 0 <= safe_ratio < warning_ratio:
+        raise ValueError("需要 0 <= safe_ratio < warning_ratio")
+    if max_image_error is None:
+        return 1.0
+    if not math.isfinite(max_image_error):
+        raise ValueError("图像偏差必须是有限值或 None")
+    return max(0.0, min(1.0, (max_image_error - safe_ratio) / (warning_ratio - safe_ratio)))
+
+
 @dataclass(frozen=True)
 class VisibilitySafetyFilter:
-    """FOV 风险时先向外站位换取角度余量；其余情况原样透传 nominal 参考。
+    """按可见性风险权重连续向外站位换取角度余量；权重为 0 时原样透传 nominal 参考。
 
     偏移约定与 :func:`band_offset` 一致，都是**观测机减目标**（tracker − target）：
     共享系期望位置是 ``p_target + offset``，再只把相对位移搬到观测机 local 系。
@@ -126,18 +143,19 @@ class VisibilitySafetyFilter:
         target: TargetState,
         observer: ObserverState,
         *,
-        predicted_exit: bool = False,
+        intervention_weight: float = 0.0,
         dt: float = 0.0,
     ) -> DesiredState:
+        if not 0.0 <= intervention_weight <= 1.0:
+            raise ValueError("干预权重必须在 [0, 1]")
         relative = _sub(observer.shared_p, target.p)
         radius = math.hypot(relative[0], relative[1])
         if radius <= 1e-9:
             return reference
-        if predicted_exit:
-            # 角度余量随距离增大，因此 FOV 风险时向带外沿后退，且按 dt 限速避免参考跳变。
-            target_radius = min(self.max_distance, radius + self.retreat_speed * max(dt, 0.0))
-        else:
-            target_radius = min(max(radius, self.min_distance), self.max_distance)
+        # 角度余量随距离增大，故风险越高越向带外沿后退；按 dt 限速避免参考跳变。
+        retreat = intervention_weight * self.retreat_speed * max(dt, 0.0)
+        target_radius = min(self.max_distance,
+                            min(max(radius, self.min_distance), self.max_distance) + retreat)
         if target_radius == radius:
             return reference
         nominal_shared = _add(_sub(reference.p, observer.local_p), observer.shared_p)
@@ -145,6 +163,177 @@ class VisibilitySafetyFilter:
         safe_shared = (target.p[0] + relative[0] * scale, target.p[1] + relative[1] * scale,
                        nominal_shared[2])
         return replace(reference, p=_add(observer.local_p, _sub(safe_shared, observer.shared_p)))
+
+
+def predict_commanded_tilt(desired_a: Vector3, yaw: float, gravity: float,
+                           min_tilt_ratio: float = 0.1) -> tuple[float, float]:
+    """复现 ``LinearControl`` 的几何倾角反解 :math:`a_o\\to b_{3,d}\\to R_{o,d}`。
+
+    ``desired_a`` 是含重力的世界系期望加速度（即 PD 输出，非控制器限幅后的值）。
+    这是把加速度候选变成未来姿态、进而变成未来相机位姿的唯一入口——roll/pitch
+    不是独立变量，而是 ``desired_a`` 和 ``yaw`` 的确定性函数。不模拟 jerk/倾角限幅器
+    的历史状态，只做单步前瞻，候选排序足够、不是精确复现。
+    """
+
+    if not math.isfinite(gravity) or gravity <= 0.0:
+        raise ValueError("重力加速度必须为正")
+    if not 0.0 < min_tilt_ratio < 1.0:
+        raise ValueError("倾角反解除数下限比例必须在 (0, 1)")
+    magnitude = math.sqrt(sum(value * value for value in desired_a))
+    if magnitude <= 0.0 or not math.isfinite(magnitude):
+        return 0.0, 0.0
+    sin_yaw, cos_yaw = math.sin(yaw), math.cos(yaw)
+    sin_roll = (desired_a[0] * sin_yaw - desired_a[1] * cos_yaw) / magnitude
+    roll = math.asin(max(-1.0, min(1.0, sin_roll)))
+    tilt_divisor = desired_a[2] if desired_a[2] >= gravity * min_tilt_ratio else gravity * min_tilt_ratio
+    pitch = math.atan2(desired_a[0] * cos_yaw + desired_a[1] * sin_yaw, tilt_divisor)
+    return roll, pitch
+
+
+def acceleration_candidates(nominal_a: Vector3, line_of_sight: Vector3,
+                           vertical_step: float, los_step: float,
+                           retreat_scale: float = 0.8) -> list[Vector3]:
+    """围绕 nominal 加速度生成一组候选动作：缩放、竖直扰动、沿视线方向扰动。
+
+    候选不直接是几何量（后退距离/高度），而是控制变量 ``a_o`` 本身——是否后退、
+    是否降高只是某个候选恰好在预测后代价最低时呈现出的*结果*，不是预先写好的规则。
+    ``line_of_sight`` 须是观测机到目标的水平单位向量；沿它扰动对应"多退/少退一步"，
+    竖直扰动对应"多爬/多降一步"。``nominal_a`` 本身也作为候选之一（不改变时的基线）。
+    """
+
+    if vertical_step < 0.0 or not math.isfinite(vertical_step):
+        raise ValueError("竖直扰动步长必须是非负有限值")
+    if los_step < 0.0 or not math.isfinite(los_step):
+        raise ValueError("视线方向扰动步长必须是非负有限值")
+    if not 0.0 < retreat_scale < 1.0:
+        raise ValueError("缩放候选比例必须在 (0, 1)")
+    los_norm = math.hypot(line_of_sight[0], line_of_sight[1])
+    los_unit = ((0.0, 0.0) if los_norm <= 1e-9
+               else (line_of_sight[0] / los_norm, line_of_sight[1] / los_norm))
+    candidates = [nominal_a, tuple(retreat_scale * value for value in nominal_a)]
+    if vertical_step > 0.0:
+        candidates.append((nominal_a[0], nominal_a[1], nominal_a[2] + vertical_step))
+        candidates.append((nominal_a[0], nominal_a[1], nominal_a[2] - vertical_step))
+    if los_step > 0.0 and los_norm > 1e-9:
+        candidates.append((nominal_a[0] + los_unit[0] * los_step, nominal_a[1] + los_unit[1] * los_step,
+                           nominal_a[2]))
+        candidates.append((nominal_a[0] - los_unit[0] * los_step, nominal_a[1] - los_unit[1] * los_step,
+                           nominal_a[2]))
+    return candidates
+
+
+def fov_cost(normalized_pixels: list[tuple[float, float] | None], safe_ratio: float) -> float:
+    """由时域内逐帧归一化像素 ``(q_x,q_y)`` 直接算 FOV 代价，不先坍缩成单一标量。
+
+    ``safe_ratio`` 内零代价（允许目标不居中，只要留在安全区），之外二次增长；
+    不可投影帧（相机后方/近像平面）记一个固定大代价，使其总是劣于任何能投影的候选。
+    """
+
+    if not 0.0 < safe_ratio <= 1.0:
+        raise ValueError("安全比例必须在 (0, 1]")
+    cost = 0.0
+    for pixel in normalized_pixels:
+        if pixel is None:
+            cost += 4.0 * (1.0 - safe_ratio) ** 2
+            continue
+        cost += max(0.0, abs(pixel[0]) - safe_ratio) ** 2 + max(0.0, abs(pixel[1]) - safe_ratio) ** 2
+    return cost
+
+
+def combined_visibility_cost(
+    *,
+    fov_cost: float | None = None,
+    fov_cost_value: float | None = None,
+    distance_cost: float = 0.0,
+    pixel_occupancy_cost: float = 0.0,
+    tracking_cost: float = 0.0,
+    smooth_cost: float = 0.0,
+    fov_weight: float = 1.0,
+    distance_weight: float = 1.0,
+    tracking_weight: float = 1.0,
+    smoothness_weight: float = 0.0,
+    pixel_occupancy_weight: float = 0.0,
+) -> float:
+    """把未来 FOV、目标像素占比、距离带、跟踪误差和平滑度汇总为一个成本。
+
+    这对应于目标函数
+        J = w_f J_FOV + w_p J_pixel + w_d J_distance + w_t J_tracking + w_u J_smooth
+    其中 ：
+    - J_FOV 来自未来像素是否离开安全中心区；
+    - J_pixel 惩罚目标投影面积占比偏离成像质量范围；
+    - J_distance 由 predictor 的距离软约束给出；
+    - J_tracking 允许一个宽松的跟踪区间，不要求固定单点；
+    - J_smooth 惩罚候选动作偏离 nominal，避免振荡。
+    """
+
+    fov_value = float(fov_cost if fov_cost is not None else fov_cost_value if fov_cost_value is not None else 0.0)
+    for weight in (fov_weight, distance_weight, tracking_weight, smoothness_weight,
+                   pixel_occupancy_weight):
+        if not math.isfinite(weight) or weight < 0.0:
+            raise ValueError("各权重必须为有限的非负值")
+    return (
+        fov_weight * fov_value
+        + pixel_occupancy_weight * float(pixel_occupancy_cost)
+        + distance_weight * float(distance_cost)
+        + tracking_weight * float(tracking_cost)
+        + smoothness_weight * float(smooth_cost)
+    )
+
+
+def relative_tracking_cost(
+    relative_position: Vector3,
+    relative_velocity: Vector3,
+    min_distance: float = 5.0,
+    max_distance: float = 10.0,
+    tracking_weight: float = 1.0,
+) -> float:
+    """相对位姿在允许安全带内不罚分，只在越界时按平方代价回落。
+
+    这不仅仅是距离安全：当目标靠近观测机或远离观测机过多时，未来可见性和跟踪控制都
+    会变差，所以用一个允许带 ``[min_distance, max_distance]`` 作为宽松目标区，并且把
+    相对速度误差加进“追踪”项，避免看到可见性风险就只知道往后退/下降。
+    """
+
+    if not 0.0 < min_distance <= max_distance:
+        raise ValueError("跟踪带必须满足 0 < min_distance <= max_distance")
+    if not math.isfinite(tracking_weight) or tracking_weight < 0.0:
+        raise ValueError("跟踪权重必须为有限的非负值")
+    radius = math.hypot(relative_position[0], relative_position[1])
+    cost = 0.0
+    if radius < min_distance:
+        cost += (min_distance - radius) ** 2
+    elif radius > max_distance:
+        cost += (radius - max_distance) ** 2
+    cost += tracking_weight * sum(component * component for component in relative_velocity)
+    return cost
+
+
+def select_visibility_optimized_acceleration(
+    candidates: list[Vector3], *, predict_cost,
+    smoothness_weight: float = 0.0, nominal_a: Vector3 | None = None,
+) -> Vector3:
+    """在候选加速度集合里选总代价最低者；``predict_cost(a) -> float`` 由调用方注入。
+
+    ``predict_cost`` 通常是「反解姿态 -> 跑可见性预测器 -> J_FOV+λ_d·J_distance」，
+    保持与 predictor 的耦合在调用方，这里只做纯粹的候选排序，可独立单测。
+    平滑正则 ``J_smooth=||a-a_nominal||^2`` 可选：权重为 0 时退化为纯视野/距离代价。
+    """
+
+    if not candidates:
+        raise ValueError("候选集不能为空")
+    if smoothness_weight < 0.0 or not math.isfinite(smoothness_weight):
+        raise ValueError("平滑正则权重必须是非负有限值")
+    if smoothness_weight > 0.0 and nominal_a is None:
+        raise ValueError("启用平滑正则时必须提供 nominal_a")
+    anchor = nominal_a if nominal_a is not None else (0.0, 0.0, 0.0)
+    best_a, best_cost = candidates[0], math.inf
+    for candidate in candidates:
+        cost = predict_cost(candidate)
+        if smoothness_weight > 0.0:
+            cost += smoothness_weight * sum((candidate[axis] - anchor[axis]) ** 2 for axis in range(3))
+        if cost < best_cost:
+            best_cost, best_a = cost, candidate
+    return best_a
 
 
 def predicted_target(target: TargetState, horizon: float) -> TargetState:
@@ -237,165 +426,3 @@ class PositionTrackerV0:
             yaw=desired_yaw,
         )
 
-
-class ImageBasedYawController:
-    """基于图像反馈的偏航控制器，确保目标在视野中央。
-    
-    参考 Yang et al. 2025 "High-Speed Interception Multicopter Control by IBVS"
-    使用 Barrier Lyapunov Function 保证目标在 FOV 内，增益随接近边界自适应增大。
-    """
-    
-    def __init__(
-        self,
-        image_width: int = 640,
-        image_height: int = 480,
-        fov_horizontal_deg: float = 60.0,
-        k_barrier: float = 0.8,  # 障碍边界（归一化）
-        deadzone_pixels: float = 20.0,
-        max_yaw_rate: float = 0.5,
-    ):
-        self.image_center_x = image_width / 2.0
-        self.image_center_y = image_height / 2.0
-        self.image_half_width = image_width / 2.0
-        self.k_barrier = k_barrier  # z1 不能超过此值
-        self.deadzone_pixels = deadzone_pixels
-        self.max_yaw_rate = max_yaw_rate
-        self.fov_horizontal_deg = fov_horizontal_deg
-    
-    def compute_yaw_rate(
-        self,
-        target_pixel_x: float,
-        target_pixel_y: float,
-    ) -> float:
-        """根据目标在图像中的像素位置计算偏航角速率。
-        
-        使用 Barrier Lyapunov 增益：gain = z1 / (k_b^2 - z1^2)
-        其中 z1 是归一化像素偏差，越接近边界增益越大。
-        
-        Args:
-            target_pixel_x: 目标在图像中的 x 坐标（像素）
-            target_pixel_y: 目标在图像中的 y 坐标（像素）
-        
-        Returns:
-            偏航角速率 (rad/s)
-        """
-        # 计算水平偏差（像素）并归一化到 [-1, 1]
-        error_x_px = target_pixel_x - self.image_center_x
-        z1 = error_x_px / self.image_half_width  # 归一化偏差
-        
-        # 死区处理
-        if abs(error_x_px) < self.deadzone_pixels:
-            return 0.0
-        
-        # 边界检查：如果 |z1| >= k_barrier，强制限幅
-        z1 = max(-self.k_barrier * 0.99, min(self.k_barrier * 0.99, z1))
-        
-        # Barrier Lyapunov 增益：接近边界时自动增大
-        kb2 = self.k_barrier ** 2
-        barrier_gain = z1 / (kb2 - z1**2)
-        
-        # 偏航角速率：负号因为目标在右→需右转（负角速率）
-        yaw_rate = -barrier_gain
-        
-        # 限幅
-        yaw_rate = max(-self.max_yaw_rate, min(self.max_yaw_rate, yaw_rate))
-        
-        return yaw_rate
-
-
-class PositionTrackerV1(PositionTrackerV0):
-    """V1: 带加速度前馈 + Barrier Lyapunov 图像偏航的位置跟踪器。
-    
-    改进点（基于 Yang 2025 + EKF 加速度估计）：
-    1. 加速度前馈：利用 EKF 估计的 target.a，补偿目标机动
-    2. Barrier Lyapunov 偏航：自适应增益，保证目标在 FOV 内
-    3. 分层控制：位置外环 + 偏航独立闭环
-    """
-    
-    def __init__(
-        self,
-        relative_offset: Vector3,
-        yaw: float = 0.0,
-        image_width: int = 640,
-        image_height: int = 480,
-        k_yaw: float = 0.002,
-        fov_horizontal_deg: float = 60.0,
-        k_barrier: float = 0.8,
-        max_yaw_rate: float = 0.5,
-        deadzone_pixels: float = 20.0,
-        feedforward_gain: float = 0.8,
-    ):
-        super().__init__(relative_offset, yaw)
-        # 保持向后兼容：k_yaw 参数已废弃，使用 Barrier Lyapunov
-        self.yaw_controller = ImageBasedYawController(
-            image_width=image_width,
-            image_height=image_height,
-            fov_horizontal_deg=fov_horizontal_deg,
-            k_barrier=k_barrier,
-            max_yaw_rate=max_yaw_rate,
-            deadzone_pixels=deadzone_pixels,
-        )
-        self.feedforward_gain = float(feedforward_gain)
-        self._current_yaw = yaw
-    
-    def generate_with_image_feedback(
-        self,
-        target: TargetState,
-        observer: ObserverState,
-        target_pixel_x: float,
-        target_pixel_y: float,
-        dt: float,
-    ) -> DesiredState:
-        """根据目标状态、EKF 加速度估计和图像反馈生成期望状态。
-        
-        控制律（改进自 Yang 2025）：
-        1. 位置外环：期望位置 = target.p + offset
-        2. 速度前馈：期望速度 = target.v（跟随目标）
-        3. 加速度前馈：期望加速度 = feedforward_gain * target.a（补偿机动）
-        4. 偏航闭环：几何前馈 + Barrier Lyapunov 图像反馈
-        
-        Args:
-            target: 目标状态（含 EKF 估计的加速度 a）
-            observer: 观测机状态
-            target_pixel_x: 目标在图像中的 x 坐标
-            target_pixel_y: 目标在图像中的 y 坐标
-            dt: 时间步长
-        
-        Returns:
-            期望状态，包含加速度前馈和图像反馈修正的偏航
-        """
-        import math
-        
-        # 1. 位置控制（继承自 V0）
-        desired_shared = _add(target.p, self.relative_offset)
-        shared_error = _sub(desired_shared, observer.shared_p)
-        desired_local = _add(observer.local_p, shared_error)
-        
-        # 2. 几何偏航作为前馈
-        delta_e = target.p[0] - observer.shared_p[0]
-        delta_n = target.p[1] - observer.shared_p[1]
-        geometric_yaw = math.atan2(delta_n, delta_e)
-        
-        # 3. Barrier Lyapunov 图像偏航修正
-        yaw_rate_correction = self.yaw_controller.compute_yaw_rate(
-            target_pixel_x, target_pixel_y
-        )
-        
-        # 4. 积分偏航角（前馈 + 反馈积分）
-        self._current_yaw = geometric_yaw + yaw_rate_correction * dt
-        
-        # 5. 加速度前馈（关键改进！利用 EKF 估计的 target.a）
-        # Yang 2025 假设加速度未知，你的 EKF 直接提供 a_target
-        desired_accel = (
-            target.a[0] * self.feedforward_gain,
-            target.a[1] * self.feedforward_gain,
-            target.a[2] * self.feedforward_gain,
-        )
-        
-        return DesiredState(
-            p=desired_local,
-            v=target.v,
-            a=desired_accel,
-            yaw=self._current_yaw,
-            yaw_rate=yaw_rate_correction,
-        )

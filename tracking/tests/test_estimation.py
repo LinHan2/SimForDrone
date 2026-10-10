@@ -330,6 +330,35 @@ class RelativeTargetEKFTest(unittest.TestCase):
 
 
 class RelativeEkfTargetEstimatorTest(unittest.TestCase):
+    def test_missing_position_predicts_and_expires_without_truth_fallback(self) -> None:
+        from types import SimpleNamespace
+        from tracking.run_tracker import relative_ekf_target_state
+
+        estimator = RelativeEkfTargetEstimator(MetricRelativeTargetEKF(position_std=0.01))
+        observer = ObserverKinematics((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0))
+        attitude = (0.0, 0.0, 0.0, 1.0)
+        self.assertIsNone(estimator.update_without_position(
+            0.0, attitude, observer, max_position_age=0.5,
+        ))
+        for step in range(30):
+            timestamp = step * 0.1
+            previous = estimator.update(
+                TargetMeasurement(timestamp, (7.0 + timestamp, 0.0, 0.0), (99.0, 0.0, 0.0)),
+                attitude, observer,
+            )
+        link = SimpleNamespace(shared_position=observer.p,
+                               odom=SimpleNamespace(v=observer.v),
+                               imu=SimpleNamespace(q=attitude, acc=(0.0, 0.0, 9.81)))
+        message = SimpleNamespace(timestamp=3.0, p=(1000.0, 0.0, 0.0),
+                                  v=(99.0, 0.0, 0.0), q=attitude)
+        predicted = relative_ekf_target_state(message, link, estimator, position_missing=True)
+        self.assertGreater(predicted.p[0], previous.p[0] + 0.08)
+        self.assertLess(predicted.p[0], 11.0)
+        self.assertAlmostEqual(predicted.v[0], 1.0, delta=0.05)
+        message.timestamp = 3.5
+        with self.assertRaisesRegex(RuntimeError, "EKF"):
+            relative_ekf_target_state(message, link, estimator, position_missing=True)
+
     def test_estimator_forwards_optional_stereo_range(self) -> None:
         filter_ = RelativeTargetEKF(stereo_range_std=0.01)
         estimator = RelativeEkfTargetEstimator(filter_)

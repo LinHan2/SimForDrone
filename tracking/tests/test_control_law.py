@@ -137,6 +137,35 @@ class TrackerLimitsTest(unittest.TestCase):
         self.controller.active = lambda: True
         self.odom = OdomData(recv_time=1.0)
 
+    def test_acceleration_preview_is_repeatable_and_matches_execution(self):
+        self.controller.calculate_control(DesiredState(), self.odom, ImuData(), now=1.0)
+        history = (self.controller._previous_time, self.controller._previous_acceleration)
+        raw = (4.0, -2.0, 1.0)
+        expected, debug = self.controller.preview_acceleration(raw, 1.05)
+        self.assertEqual(self.controller.preview_acceleration(raw, 1.05), (expected, debug))
+        self.assertEqual((self.controller._previous_time, self.controller._previous_acceleration), history)
+        self.controller.calculate_control(DesiredState(a=raw), self.odom, ImuData(), now=1.05)
+        self.assertEqual(self.controller.tracking_debug["limited_acceleration"], expected)
+
+    def test_acceleration_path_respects_limits_without_mutating_history(self):
+        self.controller.calculate_control(DesiredState(), self.odom, ImuData(), now=1.0)
+        history = (self.controller._previous_time, self.controller._previous_acceleration)
+        times = [0.0, 0.05, 0.1, 0.2, 0.5, 0.8]
+        raw = (4.0, -2.0, -1.0)
+        path = self.controller.preview_acceleration_path(raw, 1.05, times)
+        self.assertEqual(path[0], self.controller.preview_acceleration(raw, 1.05)[0])
+        self.assertEqual((self.controller._previous_time, self.controller._previous_acceleration), history)
+        self.assertGreater(math.hypot(*path[-1]), math.hypot(*path[0]))
+        for index, acceleration in enumerate(path):
+            self.assertLessEqual(math.hypot(*acceleration[:2]), self.limits.horizontal + 1e-10)
+            self.assertTrue(self.limits.vertical_min <= acceleration[2] <= self.limits.vertical_max)
+            if index:
+                dt = min(times[index] - times[index - 1], self.limits.max_dt)
+                self.assertLessEqual(math.dist(path[index - 1], acceleration), self.limits.jerk * dt + 1e-10)
+        for invalid in ([], [0.1], [0.0, 0.0], [0.0, math.nan]):
+            with self.assertRaises(ValueError):
+                self.controller.preview_acceleration_path(raw, 1.05, invalid)
+
     def test_full_pd_is_limited_without_double_counting(self):
         desired = DesiredState(p=(10.0, -10.0, 5.0), v=(6.0, -6.0, 2.0), a=(4.0, -4.0, 3.0))
         previous = (0.0, 0.0, 0.0)
@@ -192,20 +221,64 @@ class TrackerLimitsTest(unittest.TestCase):
         self.assertEqual(fsm.state, State.AUTO_HOVER)
         self.assertEqual(controller.tracking_debug, {})
 
-    def test_tracker_config_retains_soft_band_and_exposes_limits(self):
+    def test_tracker_config_disables_fixed_band_by_default_and_exposes_limits(self):
         from tracking.run_tracker import parse_args
 
         with patch("sys.argv", ["run_tracker", "--probe"]):
             args = parse_args()
         self.assertTrue(args.tracking_safety)
         self.assertTrue(args.visibility_prediction)
-        self.assertEqual((args.follow_band_min, args.follow_band_max), (5.0, 10.0))
-        self.assertEqual(args.acceleration_feedforward_gain, 0.0)
+        self.assertEqual((args.follow_band_min, args.follow_band_max), (None, None))
+        self.assertEqual(args.acceleration_feedforward_gain, 0.5)
         self.assertEqual(args.pitch_fov_compensation, 0.0)
+        self.assertEqual(args.visibility_pixel_center_weight, 4.0)
+        self.assertEqual(args.visibility_min_height, 1.5)
+        self.assertEqual(args.visibility_motion_lead_time, 0.2)
+        self.assertEqual(args.visibility_separation_min, 3.0)
+        with patch("sys.argv", ["run_tracker", "--probe", "--visibility-pixel-center-weight", "8.0"]):
+            self.assertEqual(parse_args().visibility_pixel_center_weight, 8.0)
+        with patch("sys.argv", ["run_tracker", "--probe", "--visibility-motion-lead-time", "0.3"]):
+            self.assertEqual(parse_args().visibility_motion_lead_time, 0.3)
+        with patch("sys.argv", ["run_tracker", "--probe", "--visibility-separation-min", "4.0"]):
+            self.assertEqual(parse_args().visibility_separation_min, 4.0)
         with patch("sys.argv", ["run_tracker", "--probe", "--no-tracking-safety", "--no-visibility-prediction"]):
             args = parse_args()
         self.assertFalse(args.tracking_safety)
         self.assertFalse(args.visibility_prediction)
+
+    def test_pixel_velocity_modes_validate_before_flight(self):
+        from tracking.pixel_velocity import PixelVelocityConfig
+        from tracking.run_tracker import parse_args, make_visibility_filter, make_pixel_velocity_follower
+        from tracking.visibility_prediction import CameraGeometry, VisibilityPredictor
+
+        predictor = VisibilityPredictor(CameraGeometry(((921.0, 0.0, 640.0),
+            (0.0, 921.0, 360.0), (0.0, 0.0, 1.0)), 1280, 720, (0.3, 0.0, 0.0)))
+        diagnostics = SimpleNamespace(predictor=predictor)
+        with patch("sys.argv", ["run_tracker", "--probe"]):
+            args = parse_args()
+        self.assertEqual(args.visual_tracking_mode, "legacy")
+        self.assertFalse(args.pixel_velocity_params.enabled)
+        for mode in ("nominal", "simple", "predictive"):
+            with patch("sys.argv", ["run_tracker", "--probe", "--state-source", "truth",
+                                   "--pixel-velocity-mode", mode, "--no-visibility-optimization"]):
+                args = parse_args()
+            distance_filter = make_visibility_filter(args, diagnostics)
+            follower = make_pixel_velocity_follower(args, diagnostics, distance_filter)
+            self.assertEqual(follower is not None, mode == "predictive")
+            self.assertEqual((distance_filter.min_distance, distance_filter.max_distance), (5.0, 10.0))
+        args.visibility_optimization = True
+        with self.assertRaises(ValueError):
+            make_visibility_filter(args, diagnostics)
+        args.visibility_optimization = False
+        args.tracking_safety = False
+        with self.assertRaises(ValueError):
+            make_pixel_velocity_follower(args, diagnostics, distance_filter)
+        with self.assertRaises(ValueError):
+            make_visibility_filter(args, None)
+        for options in ({"enabled": 1}, {"safe_x": math.nan}, {"weight_velocity": 0.0},
+                        {"prediction_horizon": 1.0}, {"weight_pixel": -1.0}):
+            with self.assertRaises(ValueError):
+                PixelVelocityConfig(**options)
 
     def test_run_tracker_command_loop_has_no_undefined_names(self):
         """实飞崩溃曾来自循环体里的未定义符号，静态检查必须挡住这一类。"""

@@ -7,6 +7,8 @@ from tracking.guidance import (
     PositionTrackerV0,
     TargetState,
     VisibilitySafetyFilter,
+    combined_visibility_cost,
+    visibility_intervention_weight,
     apply_feedforward_level,
     band_offset,
     follow_offset,
@@ -155,65 +157,83 @@ class PositionTrackerV0Test(unittest.TestCase):
         self.assertEqual(original.p, (0.6, -0.2, 4.0))
         self.assertEqual(shifted.p, original.p)
 
-    def test_visibility_safety_filter_is_noop_when_nominal_reference_is_safe(self) -> None:
-        filter_ = VisibilitySafetyFilter(min_distance=5.0, max_distance=10.0)
-        reference = DesiredState(p=(7.0, 0.0, 1.0), v=(0.2, 0.0, 0.0))
-        safe = filter_.apply(
+    @staticmethod
+    def retreat(weight, radius=-6.0, dt=0.05, retreat_speed=1.0, height=0.0):
+        filter_ = VisibilitySafetyFilter(min_distance=5.0, max_distance=10.0,
+                                        retreat_speed=retreat_speed)
+        reference = DesiredState(p=(radius, 0.0, height))
+        return filter_.apply(
             reference,
             TargetState(p=(0.0, 0.0, 0.0)),
-            ObserverState(shared_p=(7.0, 0.0, 1.0), local_p=(7.0, 0.0, 1.0)),
-            predicted_exit=False,
-        )
-        self.assertEqual(safe, reference)
+            ObserverState(shared_p=(radius, 0.0, height), local_p=(radius, 0.0, height)),
+            intervention_weight=weight, dt=dt,
+        ), reference
 
-    def test_visibility_safety_filter_uses_tracker_minus_target_and_preserves_height(self) -> None:
+    def test_intervention_weight_is_piecewise_linear_between_safe_and_warning(self) -> None:
+        self.assertEqual(visibility_intervention_weight(0.5, 0.6, 0.8), 0.0)
+        self.assertEqual(visibility_intervention_weight(0.6, 0.6, 0.8), 0.0)
+        self.assertAlmostEqual(visibility_intervention_weight(0.7, 0.6, 0.8), 0.5)
+        self.assertEqual(visibility_intervention_weight(0.8, 0.6, 0.8), 1.0)
+        self.assertEqual(visibility_intervention_weight(1.4, 0.6, 0.8), 1.0)
+        # 不可投影（相机后方/近像平面）是最危险情形，必须给最大干预。
+        self.assertEqual(visibility_intervention_weight(None, 0.6, 0.8), 1.0)
+
+    def test_zero_weight_leaves_nominal_reference_untouched(self) -> None:
+        safe, reference = self.retreat(0.0)
+        self.assertIs(safe, reference)
+
+    def test_partial_weight_produces_partial_retreat(self) -> None:
+        safe, _ = self.retreat(0.5)
+        self.assertAlmostEqual(safe.p[0], -6.025)
+        full, _ = self.retreat(1.0)
+        self.assertAlmostEqual(full.p[0], -6.05)
+
+    def test_retreat_is_capped_at_max_distance(self) -> None:
+        safe, _ = self.retreat(1.0, radius=-9.99, dt=1.0, retreat_speed=5.0)
+        self.assertAlmostEqual(safe.p[0], -10.0)
+
+    def test_retreat_never_changes_vertical_reference(self) -> None:
+        for weight in (0.0, 0.3, 1.0):
+            safe, _ = self.retreat(weight, height=1.5)
+            self.assertEqual(safe.p[2], 1.5)
+
+    def test_filter_pulls_reference_back_inside_band_without_touching_height(self) -> None:
         filter_ = VisibilitySafetyFilter(min_distance=5.0, max_distance=10.0)
         reference = DesiredState(p=(15.0, 0.0, 1.0), v=(1.0, 0.0, 0.0))
         safe = filter_.apply(
             reference,
             TargetState(p=(0.0, 0.0, 0.0)),
             ObserverState(shared_p=(15.0, 0.0, 1.0), local_p=(15.0, 0.0, 1.0)),
-            predicted_exit=False,
         )
         self.assertAlmostEqual(safe.p[0], 10.0)
         self.assertEqual(safe.p[2], 1.0)
 
-    def test_visibility_safety_filter_retreats_outward_on_predicted_exit(self) -> None:
-        filter_ = VisibilitySafetyFilter(min_distance=5.0, max_distance=10.0, retreat_speed=1.0)
-        reference = DesiredState(p=(-6.0, 0.0, 0.0))
-        safe = filter_.apply(
-            reference,
-            TargetState(p=(0.0, 0.0, 0.0)),
-            ObserverState(shared_p=(-6.0, 0.0, 0.0), local_p=(-6.0, 0.0, 0.0)),
-            predicted_exit=True,
-            dt=0.05,
-        )
-        self.assertAlmostEqual(safe.p[0], -6.05)
-        self.assertEqual(safe.p[2], 0.0)
+    def test_filter_rejects_out_of_range_weight(self) -> None:
+        for weight in (-0.1, 1.1):
+            with self.assertRaises(ValueError):
+                self.retreat(weight)
 
-    def test_visibility_safety_filter_keeps_inside_band_reference_unchanged(self) -> None:
-        filter_ = VisibilitySafetyFilter(min_distance=5.0, max_distance=10.0)
-        reference = DesiredState(p=(7.0, 0.0, 1.0), v=(0.2, 0.0, 0.0))
-        safe = filter_.apply(
-            reference,
-            TargetState(p=(0.0, 0.0, 0.0)),
-            ObserverState(shared_p=(7.0, 0.0, 1.0), local_p=(7.0, 0.0, 1.0)),
-            predicted_exit=True,
-            dt=0.0,
+    def test_combined_visibility_cost_scores_safe_candidates_better(self) -> None:
+        safe_cost = combined_visibility_cost(
+            fov_cost=0.0,
+            distance_cost=0.0,
+            tracking_cost=0.0,
+            smooth_cost=0.0,
         )
-        self.assertEqual(safe, reference)
-
-    def test_visibility_safety_filter_does_not_snap_reference_across_the_band(self) -> None:
-        filter_ = VisibilitySafetyFilter(min_distance=5.0, max_distance=10.0)
-        reference = DesiredState(p=(-3.0, 0.0, 0.0))
-        safe = filter_.apply(
-            reference,
-            TargetState(p=(0.0, 0.0, 0.0)),
-            ObserverState(shared_p=(-3.0, 0.0, 0.0), local_p=(-3.0, 0.0, 0.0)),
-            predicted_exit=True,
-            dt=0.05,
+        risky_cost = combined_visibility_cost(
+            fov_cost=0.25,
+            distance_cost=2.0,
+            pixel_occupancy_cost=0.5,
+            tracking_cost=0.5,
+            smooth_cost=0.1,
+            fov_weight=1.5,
+            distance_weight=1.0,
+            tracking_weight=0.5,
+            smoothness_weight=0.2,
+            pixel_occupancy_weight=2.0,
         )
-        self.assertAlmostEqual(safe.p[0], -3.05)
+        self.assertEqual(safe_cost, 0.0)
+        self.assertGreater(risky_cost, safe_cost)
 
 
 if __name__ == "__main__":

@@ -37,6 +37,7 @@ class FakeAttitude:
 class FakeLocalPosition:
     x, y, z = 1.0, 2.0, -3.0
     vx, vy, vz = 0.0, 0.0, 0.0
+    time_boot_ms = 12345
 
     @staticmethod
     def get_type() -> str:
@@ -86,6 +87,7 @@ class MavlinkInputTest(unittest.TestCase):
             link.pump()
         self.assertEqual(link.odom.attitude_recv_time, 1.0)
         self.assertEqual(link.odom.recv_time, 2.0)
+        self.assertAlmostEqual(link.odom.source_time, 12.345)
 
     def test_command_rejection_preserves_mavlink_result_for_retry_policy(self) -> None:
         params = load_params(SIM_CONFIG)

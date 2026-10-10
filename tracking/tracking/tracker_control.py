@@ -38,6 +38,48 @@ class TrackerLinearControl(LinearControl):
         self._previous_acceleration = (0.0, 0.0, 0.0)
         self._previous_time = None
 
+    def preview_acceleration(self, raw, now):
+        """返回本周期可执行加速度及诊断，不推进 jerk 限幅历史。"""
+        return self._preview_acceleration(raw, now, self._previous_acceleration, self._previous_time)
+
+    def preview_acceleration_path(self, raw, now, prediction_times):
+        """只在局部副本上推进限幅，预测保持候选命令时的可执行路径。"""
+        if (not prediction_times or prediction_times[0] != 0.0
+                or not all(math.isfinite(value) for value in prediction_times)
+                or any(right <= left for left, right in zip(prediction_times, prediction_times[1:]))):
+            raise ValueError("预测时间须从零开始且严格递增")
+        previous_a, previous_time = self._previous_acceleration, self._previous_time
+        path = []
+        for elapsed in prediction_times:
+            acceleration, _ = self._preview_acceleration(raw, now + elapsed, previous_a, previous_time)
+            path.append(acceleration)
+            previous_a, previous_time = acceleration, now + elapsed
+        return path
+
+    def _preview_acceleration(self, raw, now, previous_a, previous_time):
+        if not all(math.isfinite(value) for value in (*raw, now)):
+            raise ValueError("跟踪控制量或时间无效")
+        if previous_time is not None and now < previous_time:
+            raise ValueError("跟踪控制时钟倒退")
+
+        vertical = max(self.limits.vertical_min, min(self.limits.vertical_max, raw[2]))
+        tilt_bound = (self.params.gra + vertical) * math.tan(self.params.max_angle_rad)
+        horizontal_bound = min(self.limits.horizontal, tilt_bound)
+        horizontal = math.hypot(raw[0], raw[1])
+        scale = min(1.0, horizontal_bound / horizontal) if horizontal else 1.0
+        bounded = (raw[0] * scale, raw[1] * scale, vertical)
+        dt = 0.0 if previous_time is None else min(now - previous_time, self.limits.max_dt)
+        delta = tuple(bounded[axis] - previous_a[axis] for axis in range(3))
+        magnitude = math.hypot(*delta)
+        fraction = min(1.0, self.limits.jerk * dt / magnitude) if magnitude else 1.0
+        limited = tuple(previous_a[axis] + fraction * delta[axis] for axis in range(3))
+        debug = {
+            "raw_acceleration": raw, "limited_acceleration": limited,
+            "acceleration_limited": bounded != raw, "jerk_limited": fraction < 1.0,
+            "tilt_limited": horizontal > tilt_bound, "limiter_dt": dt,
+        }
+        return limited, debug
+
     def calculate_control(self, des, odom, imu, out=None, now=0.0):
         if not self.active():
             self._previous_time = None
@@ -50,28 +92,8 @@ class TrackerLinearControl(LinearControl):
         velocity_gains = (gains.kv0, gains.kv1, gains.kv2)
         raw = tuple(des.a[axis] + position_gains[axis] * (des.p[axis] - odom.p[axis])
                     + velocity_gains[axis] * (des.v[axis] - odom.v[axis]) for axis in range(3))
-        if not all(math.isfinite(value) for value in (*raw, now)):
-            raise ValueError("跟踪控制量或时间无效")
-        if self._previous_time is not None and now < self._previous_time:
-            raise ValueError("跟踪控制时钟倒退")
-
-        vertical = max(self.limits.vertical_min, min(self.limits.vertical_max, raw[2]))
-        tilt_bound = (self.params.gra + vertical) * math.tan(self.params.max_angle_rad)
-        horizontal_bound = min(self.limits.horizontal, tilt_bound)
-        horizontal = math.hypot(raw[0], raw[1])
-        scale = min(1.0, horizontal_bound / horizontal) if horizontal else 1.0
-        bounded = (raw[0] * scale, raw[1] * scale, vertical)
-        dt = 0.0 if self._previous_time is None else min(now - self._previous_time, self.limits.max_dt)
-        delta = tuple(bounded[axis] - self._previous_acceleration[axis] for axis in range(3))
-        magnitude = math.hypot(*delta)
-        fraction = min(1.0, self.limits.jerk * dt / magnitude) if magnitude else 1.0
-        limited = tuple(self._previous_acceleration[axis] + fraction * delta[axis] for axis in range(3))
+        limited, self.tracking_debug = self.preview_acceleration(raw, now)
         self._previous_acceleration = limited
         self._previous_time = now
-        self.tracking_debug = {
-            "raw_acceleration": raw, "limited_acceleration": limited,
-            "acceleration_limited": bounded != raw, "jerk_limited": fraction < 1.0,
-            "tilt_limited": horizontal > tilt_bound, "limiter_dt": dt,
-        }
         neutral = replace(des, p=odom.p, v=odom.v, a=limited)
         return super().calculate_control(neutral, odom, imu, out, now)

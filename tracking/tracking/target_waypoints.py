@@ -100,6 +100,15 @@ def task_defaults(params) -> argparse.Namespace:
     return args
 
 
+def trajectory_elapsed(source_time: float | None, started: float | None) -> float:
+    if source_time is None or started is None:
+        raise RuntimeError("动态轨迹需要 PX4 里程计采样时间，不能退回墙钟")
+    elapsed = source_time - started
+    if not math.isfinite(elapsed) or elapsed < 0.0:
+        raise RuntimeError("PX4 轨迹时钟无效或倒退")
+    return elapsed
+
+
 def publish_state(
     link: MavlinkLink,
     publisher: TargetStatePublisherProtocol,
@@ -421,16 +430,23 @@ def main() -> int:
             origin = link.odom.p
             fsm.request_command_control()
             started = time.monotonic()
+            trajectory_started = link.odom.source_time
             total_duration = trajectory.duration * args.trajectory_cycles
+            record["trajectory"]["time_base"] = "px4_local_position_time_boot_ms"
             next_status = started
             print(
                 f"target 动态轨迹：{args.trajectory}，{args.trajectory_cycles} 周期，"
                 f"单周期 {trajectory.duration:.2f}s，v≤{args.max_speed:.2f} m/s，"
                 f"a≤{args.max_accel:.2f} m/s²"
             )
-            while time.monotonic() - started < total_duration:
+            while True:
                 now = time.monotonic()
-                elapsed = now - started
+                link.pump()
+                elapsed = trajectory_elapsed(link.odom.source_time, trajectory_started)
+                if elapsed >= total_duration:
+                    break
+                if now - started > max(120.0, total_duration * 10.0):
+                    raise RuntimeError("PX4 轨迹时钟推进过慢，停止任务")
                 cycle_elapsed = elapsed % trajectory.duration
                 reference_p, reference_v, reference_a = reference_from_trajectory(
                     trajectory, origin, cycle_elapsed
@@ -443,7 +459,8 @@ def main() -> int:
                     {
                         # 轨迹日志必须使用相对时间；绝对 monotonic 时间会使独立运行的
                         # target/tracker 曲线无法直接对齐。
-                        "t": elapsed,
+                        "t": now - started,
+                        "trajectory_time_s": elapsed,
                         "waypoint": 0.0,
                         "error": error,
                         "actual_e": link.odom.p[0],

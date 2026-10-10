@@ -21,11 +21,12 @@ observer_camera:
   depth: true
   position: [0.30, 0.0, 0.0]
   # 相机光轴朝机体 +X（东），天然朝向 target，20m 间距
+  # 内参取 RealSense D435 RGB @1280x720 的典型值：fx≈921，HFOV≈69.4°，VFOV≈42.5°。
   orientation_deg: [0.0, 0.0, 180.0]
   resolution: [1280, 720]
   frequency_hz: 30.0
-  intrinsics: [[640.0, 0.0, 640.0], [0.0, 640.0, 360.0], [0.0, 0.0, 1.0]]
-  diagonal_fov_deg: 100.0
+  intrinsics: [[921.0, 0.0, 640.0], [0.0, 921.0, 360.0], [0.0, 0.0, 1.0]]
+  diagonal_fov_deg: 77.0
 
 viewport:
   # 俯视整个场景

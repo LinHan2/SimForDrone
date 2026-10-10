@@ -1,0 +1,48 @@
+# 顺序启动实验专用参数；命令行参数使用下划线写法，脚本自动转换成 --kebab-case。
+# 本文件覆盖 tracker.yaml 中同名参数；未列出的参数仍使用原配置。
+startup:
+  ready_timeout_s: 240  # 每个控制启动阶段的墙钟等待上限 [s]，含两机起飞；场景须事先单独启动。
+  landing_timeout_s: 180  # 中断/失败后等待各控制进程降落收尾的上限 [s]。
+target:
+  trajectory: circle  # circle / figure8 / helix。
+  trajectory_radius: 12  # 高速圆半径 [m]；6 m/s 时向心加速度为 3 m/s^2。
+  trajectory_cycles: 2  # 周期数；动态轨迹按 PX4 采样时间推进。
+  trajectory_vertical_amplitude: 0.0  # helix 垂直振幅 [m]，其他轨迹忽略。
+  max_speed: 6  # 参考速度上限 [m/s]，不是实测速度硬限幅。
+  max_accel: 4  # 参考加速度预算 [m/s^2]；含平滑启停，离线检查实际参考峰值。
+  start_delay: 0  # 起飞后额外等待 [墙钟 s]；文件握手保证 tracker 就绪才放行。
+  final_hold: 5  # 轨迹结束后悬停 [墙钟 s]。
+tracker:
+  state_source: truth  # PX4 共享状态代理；先隔离控制，暂不启用 relative-ekf。
+  feedforward: acceleration  # 理想状态基线：位置、速度、加速度全部可用；预测不随前馈档位裁剪。
+  acceleration_feedforward_gain: 0.5  # 直接加速度前馈比例；预测仍用完整加速度，当前来自轨迹参考代理。
+  visibility_prediction: true  # 优化必需；初始化失败在解锁前取消，不静默退化。
+  visibility_optimization: false  # 本轮测试不使用旧候选加速度优化。
+  no_visibility_optimization: true  # 显式覆盖 tracker.yaml 的旧优化开关。
+  pixel_velocity_mode: predictive  # C 模式：名义状态跟随 + 短时预测速度修正。
+  visibility_vertical_accel_step: 0.3  # 竖直候选扰动 [m/s^2]。
+  visibility_los_accel_step: 0.3  # 水平视线候选扰动 [m/s^2]。
+  visibility_smoothness_weight: 0.02  # 减小动作变化惩罚，允许更及时制动；jerk 限幅保持不变。
+  visibility_pixel_center_weight: 2.0  # 降低居中偏好，减少为像素居中而削弱制动；视野可行优先不变。
+  visibility_pixel_rate_weight: 0.02  # 归一化像素运动速度惩罚。
+  visibility_terminal_weight: 2.0  # 预测末端像素、距离和相对速度的附加代价。
+  visibility_effort_weight: 0.02  # 降低偏离名义动作的惩罚，让距离/速度代价更容易触发制动。
+  visibility_attitude_response_time: 0.15  # 姿态一阶响应近似 [s]，尚未实测辨识。
+  visibility_motion_lead_time: 0.2  # 候选及速度代价使用 v+a*tau；相对距离趋势生成恢复候选 [s]。
+  visibility_separation_min: 3.0  # 水平间距保护 [m]，加接近速度制动余量，优先于视野；不是安全保证。
+  visibility_min_height: 1.5  # tracker local ENU 最低高度 [m]；不等于离地净空。
+  visibility_max_vertical_speed: 1.5  # 预测垂向速度绝对值上限 [m/s]。
+  visibility_fov_weight: 1.0  # 未来视野代价权重。
+  visibility_distance_weight: 4.0  # 提高 5–10 m 距离带越界惩罚，优先减少过近风险。
+  visibility_tracking_weight: 2.0  # 提前速度误差惩罚；减小居中偏好对加速/制动的削弱，视野硬筛选仍优先。
+  horizontal_kp: 2.0  # tracker 水平位置反馈增益；保留 target 原增益。
+  tracking_safety: true  # 启用 tracker 完整加速度和 jerk 限幅。
+  max_correction_speed: 2.0  # 水平位置/趋势候选的距离恢复速度预算 [m/s]，不限制目标速度前馈。
+  tracking_horizontal_accel: 4.0  # 完整水平加速度限幅 [m/s^2]，为高速转弯留反馈余量。
+  tracking_jerk: 12.0  # tracker 完整加速度变化率限幅 [m/s^3]。
+  max_tilt_deg: 30.0  # tracker 倾角上限 [deg]；限幅预览用于候选投影。
+  max_yaw_rate: 1.2  # tracker 偏航参考速率上限 [rad/s]，先限速再预测。
+  duration: 0  # 必须为 0：持续跟踪到 target 正常结束，再自动降落。
+  status_period: 1  # TRACK 输出周期 [墙钟 s]；握手要求大于 0。
+# 起飞高度仍在 px4ctrl/config/sim.yaml 的 auto_takeoff_land.takeoff_height，当前 5 m。
+# 像素占比/相机/预测窗参数仍在 tracking/config/tracker.yaml 的 visibility_prediction 段。

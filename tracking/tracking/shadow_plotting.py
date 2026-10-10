@@ -18,12 +18,14 @@ def _plot_nine_state_response(plot, record):
                   ("relative_velocity", "Relative velocity", "m/s"),
                   ("target_acceleration", "Target acceleration", "m/s^2"))
     legend = {}
+    physical_gt = record.get("truth_kinematics") == "simulator_state_enu"
     for row, (quantity, title, unit) in enumerate(quantities):
         for column, direction in enumerate(("X / East", "Y / North", "Z / Up")):
             axis = axes[row, column]
             curves = [
                 ([sample.get("truth", {}).get(quantity) for sample in samples],
-                 "ROS pose (scoring)" if row == 0 else "Host-clock derivative (proxy)",
+                 "Simulator GT" if physical_gt else
+                 ("ROS pose (scoring)" if row == 0 else "Position derivative (proxy)"),
                  "black", "-"),
                 ([sample.get("estimate", {}).get(quantity) for sample in samples],
                  "Shadow EKF", "tab:blue", "--"),
@@ -46,7 +48,9 @@ def _plot_nine_state_response(plot, record):
             if row == 2:
                 axis.set_xlabel("Shadow elapsed time (host s)")
     figure.suptitle("Nine-state response (ENU): relative position / relative velocity / target acceleration\n"
-                   "Velocity/acceleration references are host-clock proxies, not physical-time ground truth",
+                         + ("EKF vs simulator GT (arrival-aligned, not exact acquisition-time synchronization)"
+                             if physical_gt else
+                             "Legacy position-derivative proxies; not physical-time ground truth"),
                    fontsize=13)
     figure.legend(legend.values(), legend.keys(), loc="lower center", ncol=4, fontsize=9)
     figure.tight_layout(rect=(0, 0.05, 1, 0.92))
@@ -103,3 +107,56 @@ def plot_observation(record, output: Path) -> None:
         figure.savefig(output.with_name(output.stem.replace("-observation", "-kinematics") + ".png"), dpi=150)
     finally:
         plot.close(figure)
+
+def plot_tracker_nine_state(control_samples: list[dict], output: Path, state_source: str) -> Path:
+    """为 tracker 日志绘制相对位置、相对速度和目标加速度九维响应。"""
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plot
+
+    if not control_samples:
+        raise ValueError("没有 tracker 控制样本，无法绘制九维响应")
+    times = np.asarray([sample["t"] for sample in control_samples], dtype=float)
+    segments = np.split(np.arange(len(times)), np.flatnonzero(np.diff(times) > 0.5) + 1)
+    quantities = (
+        ("relative_position", "estimated_relative_position", "Relative position", "m"),
+        ("relative_velocity", "estimated_relative_velocity", "Relative velocity", "m/s"),
+        ("target_a", "estimated_target_acceleration", "Target acceleration", "m/s^2"),
+    )
+    figure, axes = plot.subplots(3, 3, figsize=(14, 10), sharex=True)
+    try:
+        for row, (reference_key, estimate_key, title, unit) in enumerate(quantities):
+            for column, direction in enumerate(("X / East", "Y / North", "Z / Up")):
+                axis = axes[row, column]
+                for key, label, color, style in (
+                    (reference_key, "shared-state reference", "black", "-"),
+                    (estimate_key, f"{state_source} estimate", "tab:blue", "--"),
+                ):
+                    values = np.asarray([
+                        sample[key][column] if sample.get(key) is not None else np.nan
+                        for sample in control_samples
+                    ], dtype=float)
+                    values[~np.isfinite(values)] = np.nan
+                    for segment in segments:
+                        axis.plot(times[segment], values[segment], color=color, linestyle=style,
+                                  linewidth=1.3, label=label if segment[0] == 0 else None)
+                axis.set_title(f"{direction}: {title}", fontsize=11)
+                axis.set_ylabel(unit)
+                axis.grid(alpha=0.25)
+                if row == 2:
+                    axis.set_xlabel("Tracker elapsed time (s)")
+        figure.suptitle(
+            "Nine-state tracker response (ENU): relative position / velocity / target acceleration\n"
+            "Shared state is PX4 telemetry; target acceleration is trajectory reference, not visual measurement",
+            fontsize=13,
+        )
+        handles, labels = axes[0, 0].get_legend_handles_labels()
+        figure.legend(handles, labels, loc="lower center", ncol=2, fontsize=9)
+        figure.tight_layout(rect=(0, 0.05, 1, 0.92))
+        output.parent.mkdir(parents=True, exist_ok=True)
+        figure.savefig(output, dpi=150)
+    finally:
+        plot.close(figure)
+    return output

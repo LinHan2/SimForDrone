@@ -14,7 +14,8 @@ auto_takeoff_land:
   enable: true
   enable_auto_arm: true
   no_rc: true        # 仿真没有遥控器
-  takeoff_height: 2.0
+  # 双机像素闭环测试需要更高地面净空；target 与 tracker 共用此仿真起飞高度。
+  takeoff_height: 5.0
   takeoff_land_speed: 0.5
 
 thrust_model:

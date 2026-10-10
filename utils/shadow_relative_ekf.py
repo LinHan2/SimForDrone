@@ -2,7 +2,7 @@
 """只读验证：target PX4-EKF 姿态 + tracker 深度目标追踪驱动米制相对 EKF。
 
 不连接 MAVLink、不创建 px4ctrl 状态机、不发送任何飞控指令。仿真 target/tracker
-ROS 位姿只用于初帧 Oracle ROI 和离线评分，绝不作为 EKF 位置量测。
+ROS 目标位姿用于搜索提示和离线评分；位置量测来自 RGB-D，仍属于 GT 辅助关联。
 """
 
 from __future__ import annotations
@@ -16,15 +16,19 @@ from pathlib import Path
 
 import numpy as np
 import rclpy
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import AccelStamped, PoseStamped, TwistStamped
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-from sensor_msgs.msg import CameraInfo, Image
+from sensor_msgs.msg import CameraInfo, Image, Imu
 
+from tracking.estimation import observer_world_acceleration
 from tracking.relative_ekf import MetricPoseMeasurement, MetricRelativeTargetEKF
 from tracking.fov_readiness import evaluate_oracle_fov_depth
 from tracking.shadow_observation import (
     observation_time_skew,
+    depth_roi_median,
+    project_oracle_pixel,
+    world_to_camera,
     pixel_ray_body,
     range_from_optical_depth,
     relative_position_from_depth,
@@ -34,11 +38,17 @@ from tracking.shadow_observation import (
 from tracking.state_io import TargetStateSubscriber
 from tracking.shadow_plotting import plot_observation
 from utils.capture_rgbd_sample import image_to_array, stamp_seconds
+from utils.rgbd_target_detection import detect_target_pixel
 
 RGB_DEPTH_TOPIC = "/tracker_uav_1/front_camera/depth"
+RGB_TOPIC = "/tracker_uav_1/front_camera/color/image_raw"
+IMU_TOPIC = "/tracker_uav_1/sensors/imu"
 CAMERA_INFO_TOPIC = "/tracker_uav_1/front_camera/color/camera_info"
 TRACKER_POSE_TOPIC = "/tracker_uav_1/state/pose"
 TARGET_POSE_TOPIC = "/target_uav_0/state/pose"
+TRACKER_VELOCITY_TOPIC = "/tracker_uav_1/state/twist_inertial"
+TARGET_VELOCITY_TOPIC = "/target_uav_0/state/twist_inertial"
+TARGET_ACCELERATION_TOPIC = "/target_uav_0/state/accel"
 
 
 def pose_vector(message: PoseStamped) -> tuple[float, float, float]:
@@ -60,16 +70,19 @@ class ShadowRelativeEkf(Node):
         self.camera_matrix: np.ndarray | None = None
         self.tracker_pose: PoseStamped | None = None
         self.target_pose: PoseStamped | None = None
+        self.rgb: Image | None = None
+        self.imu: Imu | None = None
+        self.imu_received_at: float | None = None
+        self.last_image_stamp: float | None = None
         self.tracker_pose_received_at: float | None = None
         self.target_pose_received_at: float | None = None
         self.samples: list[dict[str, object]] = []
         self.fov_samples: list[dict[str, object]] = []
         self.last_depth_observation: tuple[float, float, float] | None = None
         self.rejections: dict[str, int] = {}
-        self._previous_truth_position: np.ndarray | None = None
-        self._previous_truth_velocity: np.ndarray | None = None
-        self._previous_truth_timestamp: float | None = None
+        self.gt_messages: dict[str, tuple[np.ndarray, float, str, float]] = {}
         self.started = time.monotonic()
+        self.last_status = self.started
         image_qos = QoSProfile(
             depth=1,
             reliability=ReliabilityPolicy.RELIABLE,
@@ -81,12 +94,27 @@ class ShadowRelativeEkf(Node):
             durability=DurabilityPolicy.VOLATILE,
         )
         self.create_subscription(Image, RGB_DEPTH_TOPIC, self.on_depth, image_qos)
+        self.create_subscription(Image, RGB_TOPIC, self.on_rgb, image_qos)
+        self.create_subscription(Imu, IMU_TOPIC, self.on_imu, pose_qos)
         self.create_subscription(CameraInfo, CAMERA_INFO_TOPIC, self.on_camera_info, image_qos)
         self.create_subscription(PoseStamped, TRACKER_POSE_TOPIC, self.on_tracker_pose, pose_qos)
         self.create_subscription(PoseStamped, TARGET_POSE_TOPIC, self.on_target_pose, pose_qos)
+        self.create_subscription(TwistStamped, TRACKER_VELOCITY_TOPIC,
+                     lambda message: self.on_gt("observer_velocity", message), pose_qos)
+        self.create_subscription(TwistStamped, TARGET_VELOCITY_TOPIC,
+                     lambda message: self.on_gt("target_velocity", message), pose_qos)
+        self.create_subscription(AccelStamped, TARGET_ACCELERATION_TOPIC,
+                     lambda message: self.on_gt("target_acceleration", message), pose_qos)
 
     def on_camera_info(self, message: CameraInfo) -> None:
         self.camera_matrix = np.asarray(message.k, dtype=np.float64).reshape(3, 3)
+
+    def on_rgb(self, message: Image) -> None:
+        self.rgb = message
+
+    def on_imu(self, message: Imu) -> None:
+        self.imu = message
+        self.imu_received_at = time.monotonic()
 
     def on_tracker_pose(self, message: PoseStamped) -> None:
         self.tracker_pose = message
@@ -99,25 +127,45 @@ class ShadowRelativeEkf(Node):
     def reject(self, reason: str) -> None:
         self.rejections[reason] = self.rejections.get(reason, 0) + 1
 
-    def truth_kinematics(
-        self,
-        relative_position: np.ndarray,
-        timestamp: float,
-    ) -> tuple[np.ndarray | None, np.ndarray | None]:
-        """以有效深度帧的本地时钟差分生成评分真值，不参与滤波更新。"""
+    def on_gt(self, quantity: str, message) -> None:
+        linear = (message.accel.linear if quantity == "target_acceleration"
+                  else message.twist.linear)
+        self.gt_messages[quantity] = (
+            np.asarray((linear.x, linear.y, linear.z), dtype=float),
+            stamp_seconds(message), message.header.frame_id, time.monotonic())
 
-        relative_velocity: np.ndarray | None = None
-        target_acceleration: np.ndarray | None = None
-        if self._previous_truth_position is not None and self._previous_truth_timestamp is not None:
-            dt = timestamp - self._previous_truth_timestamp
-            if dt > 1e-4:
-                relative_velocity = (relative_position - self._previous_truth_position) / dt
-                if self._previous_truth_velocity is not None:
-                    target_acceleration = (relative_velocity - self._previous_truth_velocity) / dt
-        self._previous_truth_position = relative_position.copy()
-        self._previous_truth_velocity = relative_velocity
-        self._previous_truth_timestamp = timestamp
-        return relative_velocity, target_acceleration
+    def truth_kinematics(self, now: float) -> tuple[np.ndarray | None, np.ndarray | None, dict]:
+        """读取仿真世界系状态，仅用于评分；缺失或过期时不差分补位。"""
+
+        vectors = {}
+        diagnostics = {}
+        for quantity, pose in (("observer_velocity", self.tracker_pose),
+                               ("target_velocity", self.target_pose),
+                               ("target_acceleration", self.target_pose)):
+            cached = self.gt_messages.get(quantity)
+            if cached is None or pose is None:
+                diagnostics[quantity] = {"status": "missing"}
+                continue
+            vector, stamp, frame, received = cached
+            age = now - received
+            skew = abs(stamp - stamp_seconds(pose))
+            valid = (frame == "map" and stamp > 0
+                     and 0 <= age <= self.args.max_pose_age_s
+                     and skew <= self.args.max_observation_skew_s)
+            valid = valid and bool(np.all(np.isfinite(vector)))
+            diagnostics[quantity] = {"status": "valid" if valid else "invalid_or_stale",
+                                     "stamp": stamp, "age_s": age,
+                                     "pose_skew_s": skew, "frame_id": frame}
+            if valid:
+                vectors[quantity] = vector
+        relative_velocity = None
+        if "target_velocity" in vectors and "observer_velocity" in vectors:
+            velocity_skew = abs(diagnostics["target_velocity"]["stamp"]
+                                - diagnostics["observer_velocity"]["stamp"])
+            diagnostics["relative_velocity_skew_s"] = velocity_skew
+            if velocity_skew <= self.args.max_observation_skew_s:
+                relative_velocity = vectors["target_velocity"] - vectors["observer_velocity"]
+        return relative_velocity, vectors.get("target_acceleration"), diagnostics
 
     def on_depth(self, message: Image) -> None:
         self.subscriber.poll()
@@ -129,6 +177,7 @@ class ShadowRelativeEkf(Node):
             or self.tracker_pose_received_at is None
             or self.target_pose_received_at is None
             or target_state is None
+            or self.imu is None or self.imu_received_at is None
         ):
             self.reject("waiting_for_inputs")
             return
@@ -147,15 +196,28 @@ class ShadowRelativeEkf(Node):
             self.reject("unsynchronized_observation")
             return
         image_stamp = stamp_seconds(message)
+        if image_stamp <= 0 or (self.last_image_stamp is not None and image_stamp <= self.last_image_stamp):
+            self.reject("nonincreasing_image_stamp")
+            return
+        if (now - self.imu_received_at > self.args.max_observation_skew_s
+            or abs(stamp_seconds(self.tracker_pose) - stamp_seconds(self.imu))
+            > self.args.max_observation_skew_s):
+            self.reject("stale_or_unsynchronized_imu")
+            return
         pose_header_skew = max(
-            abs(image_stamp - stamp_seconds(self.tracker_pose)),
-            abs(image_stamp - stamp_seconds(self.target_pose)),
+            abs(stamp_seconds(self.tracker_pose) - stamp_seconds(self.target_pose)),
+            abs(stamp_seconds(self.tracker_pose) - stamp_seconds(self.imu)),
         )
         pose_age = max(now - self.tracker_pose_received_at, now - self.target_pose_received_at)
+        if pose_header_skew > self.args.max_observation_skew_s:
+            self.reject("unsynchronized_pose_headers")
+            return
         if pose_age > self.args.max_pose_age_s:
             self.reject("stale_ros_pose")
             return
         depth = image_to_array(message)
+        if message.encoding == "16UC1":
+            depth = depth.astype(np.float32) * 0.001
         fov = evaluate_oracle_fov_depth(
             target_world=pose_vector(self.target_pose),
             tracker_world=pose_vector(self.tracker_pose),
@@ -179,7 +241,36 @@ class ShadowRelativeEkf(Node):
             "tracker_u": pose_vector(self.tracker_pose)[2],
             "target_u": pose_vector(self.target_pose)[2],
         })
-        if self.args.oracle_roi_every_frame or self.last_depth_observation is None:
+        if not self.args.legacy_depth_tracking:
+            if self.rgb is None or abs(image_stamp - stamp_seconds(self.rgb)) > 0.05:
+                self.reject("missing_or_unsynchronized_rgb")
+                return
+            projection = project_oracle_pixel(
+                pose_vector(self.target_pose), pose_vector(self.tracker_pose),
+                pose_quaternion(self.tracker_pose), tuple(self.args.camera_offset_flu),
+                self.camera_matrix, self.args.camera_forward_sign,
+            )
+            if projection is None or self.rgb.encoding not in ("rgb8", "bgr8"):
+                self.reject("invalid_rgb_search_hint")
+                return
+            colors = image_to_array(self.rgb)
+            if self.rgb.encoding == "bgr8":
+                colors = colors[..., ::-1].copy()
+            expected_optical = world_to_camera(
+                pose_vector(self.target_pose), pose_vector(self.tracker_pose),
+                pose_quaternion(self.tracker_pose), tuple(self.args.camera_offset_flu),
+                self.args.camera_forward_sign,
+            )
+            detected = detect_target_pixel(colors, depth, projection[:2], float(expected_optical[2]))
+            if detected is None:
+                self.reject("rgbd_target_not_detected")
+                return
+            pixel_u, pixel_v = detected
+            optical_depth = depth_roi_median(depth, pixel_u, pixel_v, 3)
+            if optical_depth is None:
+                self.reject("invalid_detected_depth")
+                return
+        elif self.args.oracle_roi_every_frame or self.last_depth_observation is None:
             if not fov.ready or fov.pixel_u is None or fov.pixel_v is None or fov.range_m is None:
                 self.reject(fov.reason)
                 return
@@ -206,7 +297,12 @@ class ShadowRelativeEkf(Node):
             ray_body, range_m, tuple(self.args.camera_offset_flu), pose_quaternion(self.tracker_pose)
         )
         target_thrust = rotate_vector(target_state.q, (0.0, 0.0, 1.0))
-        timestamp = now
+        specific_force = self.imu.linear_acceleration
+        observer_acceleration = observer_world_acceleration(
+            pose_quaternion(self.tracker_pose),
+            (specific_force.x, -specific_force.y, -specific_force.z),
+        )
+        timestamp = image_stamp
         try:
             estimate = self.filter.update(
                 MetricPoseMeasurement(
@@ -214,21 +310,28 @@ class ShadowRelativeEkf(Node):
                     relative_position=tuple(relative_position),
                     target_thrust_direction=tuple(target_thrust),
                 ),
-                observer_acceleration=(0.0, 0.0, 0.0),
+                observer_acceleration=observer_acceleration,
             )
         except ValueError as error:
             self.reject(f"ekf_{error}")
             return
         self.last_depth_observation = (pixel_u, pixel_v, optical_depth)
+        self.last_image_stamp = image_stamp
         truth_relative_pos = np.asarray(pose_vector(self.target_pose)) - np.asarray(pose_vector(self.tracker_pose))
-        truth_relative_vel, truth_target_acc = self.truth_kinematics(truth_relative_pos, timestamp)
+        truth_relative_vel, truth_target_acc, gt_diagnostics = self.truth_kinematics(now)
         est_pos = np.asarray(estimate.relative_position)
         est_vel = np.asarray(estimate.relative_velocity)
         est_acc = np.asarray(estimate.target_acceleration)
         P_diag = self.filter.get_covariance_diagonal()
         self.samples.append(
             {
-                "t": timestamp - self.started,
+                "t": now - self.started,
+                "image_stamp": image_stamp,
+                "gt_diagnostics": gt_diagnostics,
+                "observer_acceleration": observer_acceleration,
+                "target_thrust_direction": list(target_thrust),
+                "attitude_constraint_mode": "tangent_2d",
+                "optical_depth_m": float(optical_depth),
                 "depth_range_m": float(range_m),
                 "oracle_range_m": fov.oracle_range_m,
                 "pixel_u": pixel_u,
@@ -266,8 +369,14 @@ class ShadowRelativeEkf(Node):
                 "observation_arrival_skew_s": time_skew,
                 "ros_pose_age_s": pose_age,
                 "ros_pose_header_skew_s": pose_header_skew,
+                "cross_clock_alignment": "arrival gate only; image simulation / sensor wall clock",
             }
         )
+        if now - self.last_status >= 2.0:
+            print(f"SHADOW tangent_2d samples={len(self.samples)} "
+                  f"position_error={np.linalg.norm(est_pos - truth_relative_pos):.3f}m "
+                  f"rejections={self.rejections}", flush=True)
+            self.last_status = now
 
     def numeric_sample_values(self, key: str) -> list[float]:
         """JSON样本允许嵌套字段，统计前只保留已评分的数值。"""
@@ -289,12 +398,23 @@ class ShadowRelativeEkf(Node):
             "mode": "shadow_only_no_mavlink_control",
             "target_attitude": "target PX4 EKF ATTITUDE_QUATERNION relayed over UDP",
             "depth_measurement": (
+                "RGB-D connected component; GT-assisted search; surface Z depth"
+                if not self.args.legacy_depth_tracking else
                 "Oracle ROI every frame; depth is target surface, not center"
                 if self.args.oracle_roi_every_frame else
                 "Oracle seed once; local depth tracking thereafter; depth is target surface, not center"
             ),
             "filter": "nine-state metric position/velocity/target acceleration",
-            "observer_acceleration": "zero; static/hover validation only",
+            "observer_acceleration": "ROS IMU FRD specific force -> FLU -> ENU plus gravity",
+            "attitude_constraint_mode": "tangent_2d",
+            "filter_timebase": "ROS image simulation timestamp",
+            "cross_clock_alignment": "arrival gate only; no acquisition-time interpolation",
+            "truth_kinematics": "simulator_state_enu",
+            "truth_sources": {"position": [TARGET_POSE_TOPIC, TRACKER_POSE_TOPIC],
+                              "relative_velocity": [TARGET_VELOCITY_TOPIC, TRACKER_VELOCITY_TOPIC],
+                              "target_acceleration": TARGET_ACCELERATION_TOPIC},
+            "gt_alignment": "fresh state messages gated against pose headers; cross-clock arrival alignment only",
+            "gt_acceleration_definition": "simulator velocity difference over physics dt; includes gravity, not specific force",
             "sample_count": len(self.samples),
             "position_rmse_m": math.sqrt(sum(error * error for error in position_errors) / len(position_errors)) if position_errors else None,
             "position_max_error_m": max(position_errors) if position_errors else None,
@@ -329,6 +449,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-observation-skew-s", type=float, default=0.15)
     parser.add_argument("--roi-radius-px", type=int, default=12)
     parser.add_argument("--oracle-roi-every-frame", action="store_true")
+    parser.add_argument("--legacy-depth-tracking", action="store_true")
     parser.add_argument("--track-radius-px", type=int, default=18)
     parser.add_argument("--track-depth-tolerance-m", type=float, default=0.3)
     parser.add_argument("--range-std", type=float, default=0.05)
@@ -364,8 +485,11 @@ def main() -> int:
             return 2
         print("SHADOW READY: target state socket bound", flush=True)
         deadline = time.monotonic() + args.duration
-        while time.monotonic() < deadline:
-            rclpy.spin_once(node, timeout_sec=0.25)
+        try:
+            while time.monotonic() < deadline:
+                rclpy.spin_once(node, timeout_sec=0.25)
+        except KeyboardInterrupt:
+            pass
         output = node.write_result()
         print(f"SHADOW LOG: {output}")
         if node.samples:
@@ -375,7 +499,7 @@ def main() -> int:
     finally:
         if node is not None:
             node.close()
-        rclpy.shutdown()
+        rclpy.try_shutdown()
 
 
 if __name__ == "__main__":

@@ -35,17 +35,25 @@ from tracking.guidance import (
     ObserverState,
     PositionTrackerV0,
     TargetState,
+    Vector3,
     VisibilitySafetyFilter,
+    acceleration_candidates,
     apply_feedforward_level,
     band_offset,
+    fov_cost,
     pitch_compensated_offset,
+    predict_commanded_tilt,
     predicted_target,
     slew_yaw,
+    visibility_intervention_weight,
 )
 from tracking.relative_ekf import MetricRelativeTargetEKF
+from tracking.shadow_plotting import plot_tracker_nine_state
 from tracking.state_io import DEFAULT_STATE_HOST, DEFAULT_STATE_PORT, TargetStateSubscriber
 from tracking.tracker_control import TrackerLinearControl, TrackingLimits
 from tracking.visibility_diagnostics import summarize_tracking
+from tracking.pixel_velocity import PixelVelocityConfig, PixelVelocityFollower, summarize_velocity_follower
+from tracking.image_pixel import ImagePixelSubscriber
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = ROOT / "px4ctrl" / "config" / "sim.yaml"
@@ -65,7 +73,14 @@ def load_tracking_config(path: Path, actions: dict) -> dict:
         raise ValueError("pbvs_shadow must be a mapping")
     if not isinstance(config.get("visibility_prediction", {}), dict):
         raise ValueError("visibility_prediction must be a mapping")
-    unknown = set(config) - {"tracker", "pbvs_shadow", "visibility_prediction"}
+    pixel_options = config.get("pixel_velocity_control", {})
+    if not isinstance(pixel_options, dict):
+        raise ValueError("pixel_velocity_control must be a mapping")
+    try:
+        PixelVelocityConfig(**pixel_options)
+    except TypeError as error:
+        raise ValueError(f"invalid pixel_velocity_control: {error}") from error
+    unknown = set(config) - {"tracker", "pbvs_shadow", "visibility_prediction", "pixel_velocity_control"}
     unknown |= set(config["tracker"]) - set(actions)
     unknown |= set(shadow) - PBVS_KEYS
     if unknown:
@@ -143,6 +158,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fov-max-loss-fraction", type=float, default=0.0)
     parser.add_argument("--fov-max-gap", type=float, default=0.2)
     parser.add_argument("--pbvs-shadow", action="store_true", help="仅记录 Airsim PBVS 候选速度；实际下发仍为 V0")
+    parser.add_argument("--pixel-velocity-mode", choices=("nominal", "simple", "predictive"), default=None,
+                        help="A/B/C 对比：无像素介入/旧位置像素滤波/预测速度修正；未指定则保留旧基线")
+    parser.add_argument("--no-visibility-optimization", action="store_false", dest="visibility_optimization",
+                        help="显式关闭旧加速度优化，供速度跟随 A/B/C 对比")
     visibility = parser.add_mutually_exclusive_group()
     visibility.add_argument("--visibility-prediction", action="store_true", default=False,
                             help="仅预测并记录几何可见性；不改变控制指令")
@@ -168,6 +187,60 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="按实测俯仰抬高期望高度差的上限（m）；0 关闭。用于高速时保持目标在画面中部",
     )
+    parser.add_argument(
+        "--visibility-optimization",
+        action="store_true",
+        default=False,
+        help="开启预测性可见性感知跟踪：按候选加速度的未来像素/距离代价择优，取代固定后退规则",
+    )
+    parser.add_argument(
+        "--visibility-fov-weight",
+        type=float,
+        default=1.0,
+        help="可见性优化中未来 FOV 代价的权重；越大越重视保持目标在画面中",
+    )
+    parser.add_argument(
+        "--visibility-distance-weight",
+        type=float,
+        default=1.0,
+        help="可见性优化中距离带代价的权重；越大越重视保持相对距离在安全带内",
+    )
+    parser.add_argument(
+        "--visibility-tracking-weight",
+        type=float,
+        default=0.25,
+        help="可见性优化中相对跟踪误差的权重；让动作在保持可见的同时尽量跟住目标",
+    )
+    parser.add_argument(
+        "--visibility-vertical-accel-step",
+        type=float,
+        default=0.3,
+        help="可见性候选的竖直加速度扰动步长 [m/s^2]；0 关闭该方向候选",
+    )
+    parser.add_argument(
+        "--visibility-los-accel-step",
+        type=float,
+        default=0.3,
+        help="可见性候选沿观测机-目标视线方向的加速度扰动步长 [m/s^2]；0 关闭该方向候选",
+    )
+    parser.add_argument(
+        "--visibility-smoothness-weight",
+        type=float,
+        default=0.05,
+        help="可执行加速度相对上一周期的变化惩罚权重；抑制逐周期抖动",
+    )
+    for name, default, description in (
+        ("pixel-center-weight", 4.0, "归一化像素居中代价权重；安全区内也生效"),
+        ("pixel-rate-weight", 0.02, "归一化像素运动速度代价权重"),
+        ("terminal-weight", 2.0, "预测末端像素/距离/相对速度的附加权重"),
+        ("effort-weight", 0.05, "可执行加速度偏离名义跟踪动作的代价权重"),
+        ("attitude-response-time", 0.15, "姿态一阶响应时间近似 [s]；0 表示瞬时响应"),
+        ("motion-lead-time", 0.2, "趋势候选与速度代价的提前量 [s]；不查询目标未来航迹"),
+        ("separation-min", 3.0, "防撞水平间距下限 [m]；加制动余量后优先于视野，不是安全保证"),
+        ("min-height", 1.5, "预测最低 tracker local ENU 高度 [m]；不是地形净空"),
+        ("max-vertical-speed", 1.5, "预测垂向速度绝对值上限 [m/s]"),
+    ):
+        parser.add_argument(f"--visibility-{name}", type=float, default=default, help=description)
     parser.add_argument("--max-yaw-rate", type=float, default=0.35, help="偏航参考最大变化速度（rad/s）")
     parser.add_argument(
         "--state-source",
@@ -254,6 +327,9 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     args.pbvs_shadow_params = config.get("pbvs_shadow", {})
     args.visibility_prediction_params = config.get("visibility_prediction", {})
+    args.pixel_velocity_params = PixelVelocityConfig(**config.get("pixel_velocity_control", {}))
+    args.visual_tracking_mode = (args.pixel_velocity_mode or
+                                ("predictive" if args.pixel_velocity_params.enabled else "legacy"))
     return args
 
 
@@ -300,6 +376,339 @@ def observer_roll(attitude):
                       1.0 - 2.0 * (quat_x**2 + quat_y**2))
 
 
+def reference_distance(reference, target_state, observer: ObserverState) -> float:
+    """参考站位到目标的水平距离；参考在 local 系，先换回共享系再比较。"""
+
+    shared = tuple(reference.p[axis] - observer.local_p[axis] + observer.shared_p[axis]
+                   for axis in range(3))
+    return math.hypot(shared[0] - target_state.p[0], shared[1] - target_state.p[1])
+
+
+def make_visibility_filter(args, diagnostics):
+    if getattr(args, "visual_tracking_mode", "legacy") != "legacy":
+        if args.visibility_optimization:
+            raise ValueError("A/B/C velocity modes require --no-visibility-optimization")
+        predictor = diagnostics.predictor if diagnostics is not None else None
+        if predictor is None:
+            raise ValueError("A/B/C modes require initialized visibility_prediction")
+        if args.follow_band_min is not None and args.follow_band_max is not None:
+            return VisibilitySafetyFilter(args.follow_band_min, args.follow_band_max)
+        return VisibilitySafetyFilter(predictor.config.distance_min, predictor.config.distance_max)
+    if args.visibility_optimization:
+        predictor = diagnostics.predictor if diagnostics is not None else None
+        if predictor is None:
+            raise ValueError("可见性优化要求启用且成功初始化 visibility_prediction")
+        return VisibilitySafetyFilter(predictor.config.distance_min, predictor.config.distance_max)
+    if args.follow_band_min is not None and args.follow_band_max is not None:
+        return VisibilitySafetyFilter(args.follow_band_min, args.follow_band_max)
+    return None
+
+
+def make_pixel_velocity_follower(args, diagnostics, distance_filter):
+    if args.visual_tracking_mode != "predictive":
+        return None
+    if args.state_source != "truth" or not args.tracking_safety:
+        raise ValueError("predictive pixel velocity baseline requires truth and tracking_safety")
+    return PixelVelocityFollower(replace(args.pixel_velocity_params, enabled=True), diagnostics.predictor,
+        attitude_response_time=args.visibility_attitude_response_time,
+        distance_band=(distance_filter.min_distance, distance_filter.max_distance))
+
+
+def visibility_optimized_reference(
+    nominal_reference, target_state, link, controller, predictor,
+    *, vertical_step: float, los_step: float, smoothness_weight: float,
+    fov_weight: float = 1.0, distance_weight: float = 1.0,
+    tracking_weight: float = 0.25,
+    pixel_center_weight: float = 4.0,
+    pixel_rate_weight: float = 0.02, terminal_weight: float = 2.0,
+    effort_weight: float = 0.05, attitude_response_time: float = 0.15,
+    motion_lead_time: float = 0.2, catchup_speed_limit: float = 2.0,
+    separation_min: float | None = None,
+    min_height: float | None = None, max_vertical_speed: float = 1.5,
+    diagnostics=None,
+    now=None,
+):
+    """联合搜索三维加速度，先运动约束、再视野可行性，最后综合像素/距离/跟踪代价。"""
+    weights = (smoothness_weight, fov_weight, distance_weight, tracking_weight,
+               pixel_center_weight, pixel_rate_weight, terminal_weight, effort_weight)
+    if (not all(math.isfinite(value) and value >= 0.0 for value in weights)
+            or not all(math.isfinite(value) and value >= 0.0
+                       for value in (vertical_step, los_step, attitude_response_time, motion_lead_time))
+            or not math.isfinite(catchup_speed_limit) or catchup_speed_limit <= 0.0
+            or not math.isfinite(max_vertical_speed) or max_vertical_speed <= 0.0
+            or (separation_min is not None and (not math.isfinite(separation_min) or separation_min <= 0.0))
+            or (min_height is not None and not math.isfinite(min_height))):
+        raise ValueError("综合优化权重/步长/响应时间须非负有限，高度须有限，垂向速度上限须为正")
+    optimization_started = time.perf_counter()
+
+    gains = controller.params.gain
+    position_gains = (gains.kp0, gains.kp1, gains.kp2)
+    velocity_gains = (gains.kv0, gains.kv1, gains.kv2)
+    gra = controller.params.gra
+    nominal_a = tuple(
+        nominal_reference.a[axis]
+        + position_gains[axis] * (nominal_reference.p[axis] - link.odom.p[axis])
+        + velocity_gains[axis] * (nominal_reference.v[axis] - link.odom.v[axis])
+        for axis in range(3)
+    )
+    horizontal_limit = (controller.limits.horizontal if isinstance(controller, TrackerLinearControl)
+                        else TrackingLimits().horizontal)
+    nominal_norm = math.hypot(*nominal_a[:2])
+    nominal_scale = min(1.0, horizontal_limit / nominal_norm) if nominal_norm else 1.0
+    candidate_center = (nominal_a[0] * nominal_scale, nominal_a[1] * nominal_scale, nominal_a[2])
+    relative = tuple(target_state.p[axis] - link.shared_position[axis] for axis in range(2))
+    candidates = acceleration_candidates(candidate_center, relative, vertical_step, los_step)
+    tracker_state = TargetState(link.shared_position, link.odom.v,
+                                observer_world_acceleration(link.imu.q, link.imu.acc))
+    current = predictor.predict(target_state, tracker_state, link.odom.q, link.odom.q)
+    if not current.valid:
+        raise RuntimeError("所有可见性候选预测无效，停止跟踪并安全收尾")
+    current_pixel = current.normalized_pixels_pred[0] if current.valid else None
+    verticals = [nominal_a[2]]
+    if vertical_step > 0.0:
+        verticals.append(0.0)
+    if current_pixel is not None:
+        pixel_vertical = max(-vertical_step, min(vertical_step, -current_pixel[1]))
+        candidates.append((candidate_center[0], candidate_center[1], nominal_a[2] + pixel_vertical))
+        if vertical_step > 0.0:
+            shifted = predictor.predict(target_state, replace(tracker_state,
+                p=(tracker_state.p[0], tracker_state.p[1], tracker_state.p[2] + 0.1)), link.odom.q, link.odom.q)
+            shifted_pixel = shifted.normalized_pixels_pred[0] if shifted.valid else None
+            if shifted_pixel is not None:
+                derivative = (shifted_pixel[1] - current_pixel[1]) / 0.1
+                if abs(derivative) > 1e-5:
+                    height_error = max(-3.0, min(3.0, -current_pixel[1] / derivative))
+                    pixel_a = (nominal_reference.a[2] + gains.kp2 * height_error
+                               + gains.kv2 * (target_state.v[2] - tracker_state.v[2]))
+                    limits = controller.limits if isinstance(controller, TrackerLinearControl) else TrackingLimits()
+                    verticals.append(max(limits.vertical_min, min(limits.vertical_max, pixel_a)))
+    horizontals = [(candidate[0], candidate[1]) for candidate in candidates]
+    trend_a = None
+    correction_speed = 0.0
+    trend_velocity = tuple(target_state.v[axis] + target_state.a[axis] * motion_lead_time
+                           for axis in range(3))
+    if los_step > 0.0:
+        horizontals.append((0.5 * candidate_center[0], 0.5 * candidate_center[1]))
+        radius = math.hypot(*relative)
+        tangent = (-relative[1] / radius, relative[0] / radius) if radius > 1e-6 else (0.0, 1.0)
+        horizontals.extend((candidate_center[0] + sign * los_step * tangent[0],
+                    candidate_center[1] + sign * los_step * tangent[1]) for sign in (-1.0, 1.0))
+        future_relative = tuple(target_state.p[axis] - tracker_state.p[axis]
+                                + (target_state.v[axis] - tracker_state.v[axis]) * motion_lead_time
+                                + 0.5 * (target_state.a[axis] - tracker_state.a[axis]) * motion_lead_time**2
+                                for axis in range(3))
+        future_distance = math.hypot(*future_relative)
+        future_radius = math.hypot(*future_relative[:2])
+        distance_error = future_distance - max(predictor.config.distance_min,
+                                              min(predictor.config.distance_max, future_distance))
+        speed_gain = min(position_gains[axis] / velocity_gains[axis] for axis in range(2))
+        correction_speed = max(-catchup_speed_limit, min(catchup_speed_limit, speed_gain * distance_error))
+        direction = (tuple(value / future_radius for value in future_relative[:2])
+                     if future_radius > 1e-6 else (0.0, 0.0))
+        trend_a = tuple(target_state.a[axis] + velocity_gains[axis] * (
+            trend_velocity[axis] + correction_speed * direction[axis]
+            - tracker_state.v[axis]) for axis in range(2))
+        trend_norm = math.hypot(*trend_a)
+        scale = min(1.0, horizontal_limit / trend_norm) if trend_norm else 1.0
+        trend_a = tuple(value * scale for value in trend_a)
+        horizontals.append(trend_a)
+        horizontals.extend(tuple(candidate_center[axis] + fraction * (trend_a[axis] - candidate_center[axis])
+                     for axis in range(2)) for fraction in (0.25, 0.6))
+    previous_a = controller._previous_acceleration if isinstance(controller, TrackerLinearControl) else nominal_a
+    if separation_min is not None:
+        radius = math.hypot(*relative)
+        if radius > 1e-6:
+            horizontals.append(tuple(-horizontal_limit * value / radius for value in relative))
+    if isinstance(controller, TrackerLinearControl):
+        horizontals.append(previous_a[:2])
+        candidates.append(previous_a)
+    candidates = list(dict.fromkeys(candidates + [
+        (horizontal[0], horizontal[1], vertical)
+        for horizontal in dict.fromkeys(horizontals) for vertical in dict.fromkeys(verticals)]))
+    effective_accelerations = {}
+    evaluations = {}
+    predictions = {}
+    cost_components = {}
+    separation_risks = {}
+    separation_margins = {}
+    separation_reserves = {}
+
+    def separation_profile(prediction, path):
+        limits = controller.limits if isinstance(controller, TrackerLinearControl) else TrackingLimits()
+        braking_limit = min(horizontal_limit, (gra + limits.vertical_min) * math.tan(
+            controller.params.max_angle_rad)) if isinstance(controller, TrackerLinearControl) else horizontal_limit
+        margins, reserves = [], []
+        positions = prediction.relative_positions_world
+        velocities = [tuple(target[axis] - tracker[axis] for axis in range(2))
+                      for target, tracker in zip(prediction.target_velocities_pred,
+                                                 prediction.tracker_velocities_pred)]
+        for index, position in enumerate(positions):
+            distance = math.hypot(*position[:2])
+            direction = tuple(value / distance for value in position[:2]) if distance > 1e-6 else (0.0, 0.0)
+            closing = max(0.0, -sum(velocities[index][axis] * direction[axis] for axis in range(2)))
+            relative_braking = max(1e-6, braking_limit + sum(
+                target_state.a[axis] * direction[axis] for axis in range(2)))
+            acceleration = previous_a if index == 0 else path[index]
+            reversal_time = max(0.0, braking_limit + sum(
+                acceleration[axis] * direction[axis] for axis in range(2))) / limits.jerk
+            delay = attitude_response_time + (prediction.prediction_times[1]
+                                             - prediction.prediction_times[0]) + reversal_time
+            reserve = closing * delay + closing**2 / (2.0 * relative_braking)
+            reserves.append(reserve)
+            margins.append(distance - separation_min - reserve)
+            if index:
+                segment = tuple(position[axis] - positions[index - 1][axis] for axis in range(2))
+                length_squared = sum(value**2 for value in segment)
+                fraction = max(0.0, min(1.0, -sum(positions[index - 1][axis] * segment[axis]
+                    for axis in range(2)) / length_squared)) if length_squared > 0.0 else 0.0
+                swept_distance = math.hypot(*(positions[index - 1][axis] + fraction * segment[axis]
+                                             for axis in range(2)))
+                margins.append(swept_distance - separation_min)
+        violations = [max(0.0, -value) for value in margins]
+        return min(margins), (max(violations), sum(violations), -math.hypot(*positions[-1][:2])), reserves[0]
+
+    def predict_cost(candidate_a: Vector3) -> float:
+        raw_candidate = candidate_a
+        times = current.prediction_times
+        if now is not None and isinstance(controller, TrackerLinearControl) and controller.active():
+            path = controller.preview_acceleration_path(candidate_a, now, times)
+        else:
+            path = [candidate_a] * len(times)
+        effective_accelerations[raw_candidate] = path[0]
+        attitudes = []
+        for acceleration in path:
+            total_a = (acceleration[0], acceleration[1], acceleration[2] + gra)
+            roll, pitch = predict_commanded_tilt(total_a, nominal_reference.yaw, gra)
+            attitudes.append(_quat_from_zyx(nominal_reference.yaw, pitch, roll))
+        prediction = predictor.predict(
+            target_state, replace(tracker_state, a=path[0]), link.odom.q, attitudes[0],
+            tracker_acceleration_reliable=True, tracker_acceleration_path=path,
+            commanded_attitude_path=attitudes, attitude_response_time=attitude_response_time,
+            include_attitude_comparison=False,
+        )
+        if not prediction.valid:
+            evaluations[raw_candidate] = (False, math.inf, False, (math.inf, math.inf))
+            separation_risks[raw_candidate] = (math.inf, math.inf, math.inf)
+            separation_margins[raw_candidate] = -math.inf
+            return math.inf
+        predictions[raw_candidate] = prediction
+        if separation_min is not None:
+            margin, separation_risk, reserve = separation_profile(prediction, path)
+            separation_margins[raw_candidate] = margin
+            separation_risks[raw_candidate] = separation_risk
+            separation_reserves[raw_candidate] = reserve
+        else:
+            separation_margins[raw_candidate] = 0.0
+            separation_risks[raw_candidate] = (0.0, 0.0, 0.0)
+            separation_reserves[raw_candidate] = 0.0
+        projections = prediction.attitude_predictions["command_based_attitude"]
+        future_pixels = projections.normalized_pixels_pred[1:]
+        fov_feasible = bool(future_pixels) and all(
+            pixel is not None and max(abs(pixel[0]), abs(pixel[1])) <= predictor.config.fov_safe_ratio
+            for pixel in future_pixels
+        )
+        risk = (sum(pixel is None for pixel in future_pixels),
+            fov_cost(future_pixels, predictor.config.fov_safe_ratio))
+        heights = [link.odom.p[2] + position[2] - tracker_state.p[2]
+                   for position in prediction.tracker_positions_pred[1:]]
+        motion_risk = sum(max(0.0, abs(velocity[2]) - max_vertical_speed) ** 2
+                          for velocity in prediction.tracker_velocities_pred[1:])
+        if min_height is not None:
+            motion_risk += sum(max(0.0, min_height - height) ** 2 for height in heights)
+        evaluations[raw_candidate] = (motion_risk <= 1e-12, motion_risk, fov_feasible, risk)
+        component = dict.fromkeys(("pixel_center", "pixel_rate", "distance", "tracking", "effort"), 0.0)
+        horizon = times[-1]
+        for index in range(1, len(times)):
+            dt = times[index] - times[index - 1]
+            stage_weight = dt / horizon + (terminal_weight if index == len(times) - 1 else 0.0)
+            pixel = projections.normalized_pixels_pred[index]
+            previous_pixel = projections.normalized_pixels_pred[index - 1]
+            if pixel is not None:
+                component["pixel_center"] += stage_weight * sum(value**2 for value in pixel)
+                if previous_pixel is not None:
+                    component["pixel_rate"] += dt / horizon * sum(
+                        ((pixel[axis] - previous_pixel[axis]) / dt) ** 2 for axis in range(2))
+            distance = prediction.distances_pred[index]
+            component["distance"] += stage_weight * (
+                predictor.config.distance_min_weight * max(0.0, predictor.config.distance_min - distance)**2
+                + predictor.config.distance_max_weight * max(0.0, distance - predictor.config.distance_max)**2)
+            component["tracking"] += stage_weight * sum(
+                (prediction.target_velocities_pred[index][axis]
+                 + target_state.a[axis] * motion_lead_time
+                 - prediction.tracker_velocities_pred[index][axis])**2 for axis in range(3))
+            component["effort"] += dt / horizon * sum((path[index][axis] - nominal_a[axis])**2
+                                                      for axis in range(3))
+        component["continuity"] = sum((path[0][axis] - previous_a[axis])**2 for axis in range(3))
+        component["fov"] = risk[1] / len(future_pixels)
+        component["occupancy"] = (prediction.pixel_occupancy_cost or 0.0) / len(times)
+        cost_components[raw_candidate] = component
+        return (pixel_center_weight * component["pixel_center"]
+                + pixel_rate_weight * component["pixel_rate"]
+                + distance_weight * component["distance"]
+                + tracking_weight * component["tracking"]
+                + effort_weight * component["effort"]
+                + smoothness_weight * component["continuity"]
+                + fov_weight * component["fov"]
+                + predictor.config.pixel_occupancy_weight * component["occupancy"])
+
+    costs = {candidate: predict_cost(candidate) for candidate in candidates}
+    if not any(math.isfinite(cost) for cost in costs.values()):
+        raise RuntimeError("所有可见性候选预测无效，停止跟踪并安全收尾")
+    motion_candidates = [candidate for candidate in candidates if evaluations[candidate][0]]
+    separation_candidates = [candidate for candidate in motion_candidates
+                             if separation_margins[candidate] >= -1e-9]
+    feasible_candidates = [candidate for candidate in separation_candidates if evaluations[candidate][2]]
+    if feasible_candidates:
+        best_a = min(feasible_candidates, key=costs.get)
+        selection_mode = "feasible"
+    elif separation_candidates:
+        best_a = min(separation_candidates, key=lambda candidate: (evaluations[candidate][3], costs[candidate]))
+        selection_mode = "recovery_separation_fov" if separation_min is not None else "recovery_minimum_risk"
+    elif motion_candidates:
+        best_a = min(motion_candidates, key=lambda candidate: (separation_risks[candidate],
+            evaluations[candidate][3], costs[candidate]))
+        selection_mode = "recovery_separation_constraints"
+    else:
+        best_a = min(candidates, key=lambda candidate: (
+            evaluations[candidate][1], separation_risks[candidate], evaluations[candidate][3], costs[candidate]))
+        selection_mode = "recovery_motion_constraints"
+    if diagnostics is not None:
+        selected_prediction = predictions[best_a]
+        diagnostics.update(pixel_feedback_source="ideal_state_projection_not_image_detection",
+                           current_normalized_pixel=current_pixel,
+                           optimizer="joint_acceleration_lattice_receding_horizon",
+                           optimizer_candidate_count=len(candidates),
+                           optimizer_elapsed_ms=1000.0 * (time.perf_counter() - optimization_started),
+                           optimizer_cost=costs[best_a], optimizer_cost_components=cost_components[best_a],
+                           predicted_terminal_pixel=selected_prediction.attitude_predictions[
+                               "command_based_attitude"].normalized_pixels_pred[-1],
+                           predicted_terminal_distance=selected_prediction.distances_pred[-1],
+                           motion_feasible_candidate_count=len(motion_candidates),
+                           motion_constraints_feasible=bool(motion_candidates),
+                           separation_guard_enabled=separation_min is not None,
+                           separation_min_m=separation_min,
+                           separation_feasible_candidate_count=len(separation_candidates),
+                           separation_constraints_feasible=bool(separation_candidates),
+                           predicted_separation_margin_m=separation_margins[best_a],
+                           separation_braking_reserve_m=separation_reserves[best_a],
+                           separation_guarantee=False,
+                           fov_candidate_feasible=bool(feasible_candidates),
+                           fov_feasible_candidate_count=len(feasible_candidates),
+                           fov_selection_mode=selection_mode,
+                           current_fov_safe=(current_pixel is not None and
+                               max(abs(current_pixel[0]), abs(current_pixel[1])) <= predictor.config.fov_safe_ratio),
+                           fov_guarantee=False,
+                           prediction_target_acceleration=target_state.a,
+                           motion_lead_time_s=motion_lead_time,
+                           target_trend_velocity=trend_velocity,
+                           tracking_velocity_lead=tuple(value * motion_lead_time for value in target_state.a),
+                           trend_horizontal_acceleration=trend_a,
+                           distance_correction_speed=correction_speed,
+                           predicted_effective_acceleration=effective_accelerations[best_a],
+                           fov_prediction_scope="jerk_limited_acceleration_path_with_first_order_attitude_response")
+    return replace(nominal_reference, p=link.odom.p, v=link.odom.v, a=best_a)
+
+
 def command_from_reference(reference) -> CommandData:
     return CommandData(
         recv_time=time.monotonic(),
@@ -317,6 +726,7 @@ def relative_ekf_target_state(
     link: MavlinkLink,
     estimator: RelativeEkfTargetEstimator,
     measurement: TargetMeasurement | None = None,
+    *, position_missing: bool = False, max_position_age: float = 0.5,
 ):
     """由目标量测/姿态与观测机 IMU 构造 EKF 目标状态，不让真值速度进入制导。"""
 
@@ -325,6 +735,11 @@ def relative_ekf_target_state(
         v=link.odom.v,
         a=observer_world_acceleration(link.imu.q, link.imu.acc),
     )
+    if position_missing:
+        return estimator.update_without_position(
+            target_message.timestamp, target_message.q, observer,
+            max_position_age=max_position_age,
+        )
     return estimator.update(
         measurement or TargetMeasurement(target_message.timestamp, target_message.p, target_message.v),
         target_message.q,
@@ -389,6 +804,18 @@ def main() -> int:
         )
     limits = TrackingLimits(args.tracking_horizontal_accel, args.tracking_vertical_accel_min,
                             args.tracking_vertical_accel_max, args.tracking_jerk, args.tracking_max_dt)
+    optimizer_nonnegative = (
+        args.visibility_fov_weight, args.visibility_distance_weight, args.visibility_tracking_weight,
+        args.visibility_smoothness_weight, args.visibility_pixel_center_weight, args.visibility_pixel_rate_weight,
+        args.visibility_terminal_weight, args.visibility_effort_weight, args.visibility_attitude_response_time,
+        args.visibility_motion_lead_time,
+        args.visibility_vertical_accel_step, args.visibility_los_accel_step,
+    )
+    if (not all(math.isfinite(value) and value >= 0.0 for value in optimizer_nonnegative)
+            or not math.isfinite(args.visibility_separation_min) or args.visibility_separation_min <= 0.0
+            or not math.isfinite(args.visibility_min_height)
+            or not math.isfinite(args.visibility_max_vertical_speed) or args.visibility_max_vertical_speed <= 0.0):
+        raise ValueError("综合优化权重/步长/响应时间须非负有限，高度须有限，垂向速度上限须为正")
     assessment_options = dict(central_margin=args.fov_central_margin, min_coverage=args.fov_min_coverage,
                               min_central_fraction=args.fov_min_central_fraction,
                               max_loss_fraction=args.fov_max_loss_fraction, max_gap=args.fov_max_gap)
@@ -411,18 +838,17 @@ def main() -> int:
     record["tracking_safety"] = {"enabled": args.tracking_safety, **asdict(limits)}
     record["acceleration_feedforward_gain"] = args.acceleration_feedforward_gain
     record["passed_scope"] = "safe_landing_and_disarm_only; see tracking_assessment"
-    # 任务优先级必须严格遵守：保持目标可见 > 保持安全距离 > 相对位置/速度误差收敛 > 尽量复制目标机动。
-    # 也就是说，正常情况下 a_safe = a_nom；当目标快出视野时，安全过滤器必须偏离 nominal controller，
-    # 先保护视野，再恢复中间层的距离与误差控制，最后才考虑模仿目标机动。
     record["control_priority"] = [
+        "respect_motion_constraints_and_actuator_limits",
+        "preserve_minimum_separation_and_braking_reserve",
         "keep_target_visible",
-        "keep_safe_distance",
+        "restore_preferred_distance_band",
         "reduce_relative_position_and_velocity_error",
         "imitate_target_motion",
     ]
     record["tracking_objective"] = (
-        "nominal_tracking_controller_plus_fov_safety_filter; "
-        "keep_target_visible_first_then_safe_distance_then_tracking_error_then_target_motion"
+        "joint_pixel_distance_tracking_acceleration_optimizer; "
+        "motion_constraints_then_separation_then_fov_feasibility_then_combined_tracking_cost"
     )
     record["position_source"] = "PX4_shared_ENU_proxy_not_Isaac_GT"
     visibility_samples: list[dict[str, object]] = []
@@ -454,8 +880,27 @@ def main() -> int:
     }
     record["relative_ekf_warmup_seconds"] = args.relative_ekf_warmup_seconds
     record["pbvs_shadow"] = args.pbvs_shadow
+    record["visual_tracking_mode"] = args.visual_tracking_mode
+    record["pixel_velocity_control"] = {
+        **asdict(args.pixel_velocity_params), "enabled": args.visual_tracking_mode == "predictive",
+        "decision_variable": "velocity_reference_only", "nominal_velocity": "guidance_reference_v",
+        "solver": "single_local_weighted_least_squares_3x3_with_bounded_backtracking",
+        "position_and_acceleration_reference": "unchanged",
+        "attitude_model": "PD_jerk_preview_first_order_command_attitude",
+        "no_visibility_or_collision_guarantee": True,
+    }
+    if args.visual_tracking_mode != "legacy":
+        record["control_priority"] = ["existing_actuator_limits", "nominal_tracking_with_optional_pixel_correction"]
+        record["tracking_objective"] = args.visual_tracking_mode + "_velocity_follower"
 
+    visibility_filter = None
+    image_subscriber = None
     try:
+        visibility_filter = make_visibility_filter(args, visibility_diagnostics)
+        pixel_velocity_follower = make_pixel_velocity_follower(args, visibility_diagnostics, visibility_filter)
+        if pixel_velocity_follower is not None:
+            image_subscriber = ImagePixelSubscriber()
+            record["pixel_velocity_control"]["pixel_source"] = "timestamped_rgbd_detection_only"
         link.open()
         wait_ready(link, fsm, defaults.ready_timeout, print)
         wait_tracker_shared(link, fsm, defaults.ready_timeout)
@@ -505,10 +950,10 @@ def main() -> int:
                 if target_gate.accept(target_message.timestamp):
                     truth = target_message.as_target_state()
                     measurement = relative_sensor.measure(truth, target_message.timestamp)
-                    if measurement is not None:
-                        target_state = relative_ekf_target_state(
-                            target_message, link, relative_estimator, measurement
-                        )
+                    target_state = relative_ekf_target_state(
+                        target_message, link, relative_estimator, measurement,
+                        position_missing=measurement is None, max_position_age=args.state_timeout,
+                    )
                 time.sleep(rate)
             if target_state is None:
                 raise RuntimeError("relative-ekf 预热期间未收到有效位置量测")
@@ -532,12 +977,6 @@ def main() -> int:
             )
 
         guidance = PositionTrackerV0(relative_offset=relative_offset, yaw=args.yaw)
-        visibility_filter = None
-        if args.follow_band_min is not None and args.follow_band_max is not None:
-            visibility_filter = VisibilitySafetyFilter(
-                min_distance=args.follow_band_min,
-                max_distance=args.follow_band_max,
-            )
         pbvs = None
         if args.pbvs_shadow:
             pbvs = load_controller()(**args.pbvs_shadow_params, dt=rate)
@@ -576,19 +1015,19 @@ def main() -> int:
                 # 不得重复量测更新，否则 dt=0 破坏时间假设。
                 if target_gate.accept(target_message.timestamp):
                     measurement = relative_sensor.measure(truth, target_message.timestamp)
-                    if measurement is not None:
-                        target_state = relative_ekf_target_state(
-                            target_message,
-                            link,
-                            relative_estimator,
-                            measurement,
-                        )
+                    target_state = relative_ekf_target_state(
+                        target_message, link, relative_estimator, measurement,
+                        position_missing=measurement is None, max_position_age=args.state_timeout,
+                    )
                 if target_state is None:
                     raise RuntimeError("relative-ekf 尚无有效目标估计")
             else:
                 target_state, measurement = select_target_state(
                     args.state_source, truth, now, sensor, estimator
                 )
+            # 九维图记录控制器选用的原始目标估计，前馈裁剪和时域外推另由指令字段体现。
+            state_estimate = target_state
+            prediction_target_state = state_estimate
             if target_is_new:
                 previous_truth_timestamp = target_message.timestamp
             if visibility_diagnostics is not None:
@@ -597,34 +1036,56 @@ def main() -> int:
             # 先裁剪前馈层级再外推，保证 A/B/C 基线只差前馈项本身。
             target_state = apply_feedforward_level(target_state, args.feedforward)
             target_state = predicted_target(target_state, args.prediction_horizon)
-            if args.follow_band_min is not None and args.follow_band_max is not None:
-                # 以当前实测相对位置为基准：带内不牵引，只在越界时缩放回边界。
+            if visibility_filter is not None:
                 current_relative = tuple(
                     link.shared_position[index] - target_state.p[index] for index in range(3)
                 )
-                relative_offset = band_offset(
-                    current_relative, args.follow_band_min, args.follow_band_max,
-                    args.follow_height_offset,
-                )
-                if args.pitch_fov_compensation > 0.0:
-                    # 用上一周期的指令俯仰而非实测俯仰：实测滞后指令最大约 7°，
-                    # 按实测补偿会在高速段留下与出画同量级的残差。
-                    relative_offset = pitch_compensated_offset(
-                        relative_offset, commanded_pitch, args.pitch_fov_compensation
+                if args.visibility_optimization:
+                    # 不再夹断到固定站位带：站位完全交给可见性优化器的 LOS 候选 +
+                    # predictor 的软距离代价去规划，这里只保留当前方位与高度跟随意图。
+                    relative_offset = (current_relative[0], current_relative[1],
+                                       current_relative[2] if args.follow_height_offset is None
+                                       else args.follow_height_offset)
+                else:
+                    # 以当前实测相对位置为基准：带内不牵引，只在越界时缩放回边界。
+                    relative_offset = band_offset(
+                        current_relative, visibility_filter.min_distance, visibility_filter.max_distance,
+                        args.follow_height_offset,
                     )
+                    if args.pitch_fov_compensation > 0.0:
+                        # 用上一周期的指令俯仰而非实测俯仰：实测滞后指令最大约 7°，
+                        # 按实测补偿会在高速段留下与出画同量级的残差。
+                        relative_offset = pitch_compensated_offset(
+                            relative_offset, commanded_pitch, args.pitch_fov_compensation
+                        )
                 guidance = PositionTrackerV0(relative_offset=relative_offset, yaw=args.yaw,
                                              max_position_error=args.max_position_error,
                                              max_correction_speed=args.max_correction_speed,
                                              position_to_speed_gain=position_to_speed_gain)
-            # 实际指令: (p_ref^L, v_ref, a_ref, psi_ref) 由 V0 生成；此处无像素误差反馈。
+            # V0 只生成名义参考；下方联合优化器再使用像素预测选择实际加速度。
             reference = guidance.generate(
                 target_state,
                 ObserverState(shared_p=link.shared_position, local_p=link.odom.p),
             )
             reference = replace(reference, a=tuple(args.acceleration_feedforward_gain * value
                                                    for value in reference.a))
-            if visibility_filter is not None:
-                predicted_fov_exit = False
+            commanded_yaw = slew_yaw(commanded_yaw, reference.yaw, args.max_yaw_rate * (now - last_yaw_at))
+            last_yaw_at = now
+            reference = replace(reference, yaw=commanded_yaw)
+            predicted_max_image_error = None
+            intervention_weight = 0.0
+            visibility_filter_active = False
+            original_reference_distance = None
+            filtered_reference_distance = None
+            nominal_reference = reference
+            optimization_diagnostics = {}
+            if pixel_velocity_follower is not None:
+                reference, optimization_diagnostics = pixel_velocity_follower.apply(
+                    reference, prediction_target_state, link, controller, now=now,
+                    image_detection=image_subscriber.read(now))
+                visibility_filter_active = optimization_diagnostics["pixel_velocity_active"]
+            elif visibility_filter is not None and args.visual_tracking_mode != "nominal":
+                tracker_state = None
                 # 预测器可能因配置/标定错误而不可用，此时退化为纯 nominal 跟踪而不是中断飞行。
                 if visibility_diagnostics is not None and visibility_diagnostics.predictor is not None:
                     tracker_state = TargetState(link.shared_position, link.odom.v,
@@ -632,21 +1093,52 @@ def main() -> int:
                     desired_world_attitude = _quat_from_zyx(reference.yaw, observer_pitch(link.odom.q),
                                                             observer_roll(link.odom.q))
                     prediction = visibility_diagnostics.predictor.predict(
-                        target_state, tracker_state, link.odom.q, desired_world_attitude,
+                        prediction_target_state, tracker_state, link.odom.q, desired_world_attitude,
                         tracker_acceleration_reliable=all(math.isfinite(value) for value in tracker_state.a),
                     )
-                    predicted_fov_exit = bool(prediction.valid and prediction.predicted_fov_exit)
+                    if prediction.valid:
+                        settings = visibility_diagnostics.predictor.config
+                        predicted_max_image_error = prediction.max_image_error
+                        intervention_weight = visibility_intervention_weight(
+                            predicted_max_image_error, settings.fov_safe_ratio, settings.fov_warning_ratio)
                 filter_dt = 0.0 if last_filter_at is None else now - last_filter_at
                 last_filter_at = now
-                reference = visibility_filter.apply(
-                    reference, target_state,
-                    ObserverState(shared_p=link.shared_position, local_p=link.odom.p),
-                    predicted_exit=predicted_fov_exit, dt=filter_dt,
-                )
+                observer_state = ObserverState(shared_p=link.shared_position, local_p=link.odom.p)
+                nominal_reference = reference
+                if (args.visibility_optimization and tracker_state is not None
+                        and visibility_diagnostics is not None and visibility_diagnostics.predictor is not None):
+                    # 预测性可见性感知跟踪：候选加速度各自反解未来姿态、投影未来像素，
+                    # 选代价最低者，而不是先判定风险再套固定的后退/降高规则。
+                    reference = visibility_optimized_reference(
+                        reference, prediction_target_state, link, controller, visibility_diagnostics.predictor,
+                        vertical_step=args.visibility_vertical_accel_step,
+                        los_step=args.visibility_los_accel_step,
+                        smoothness_weight=args.visibility_smoothness_weight,
+                        fov_weight=args.visibility_fov_weight,
+                        distance_weight=args.visibility_distance_weight,
+                        tracking_weight=args.visibility_tracking_weight,
+                        pixel_center_weight=args.visibility_pixel_center_weight,
+                        pixel_rate_weight=args.visibility_pixel_rate_weight,
+                        terminal_weight=args.visibility_terminal_weight,
+                        effort_weight=args.visibility_effort_weight,
+                        attitude_response_time=args.visibility_attitude_response_time,
+                        motion_lead_time=args.visibility_motion_lead_time,
+                        catchup_speed_limit=args.max_correction_speed,
+                        separation_min=args.visibility_separation_min,
+                        min_height=args.visibility_min_height,
+                        max_vertical_speed=args.visibility_max_vertical_speed,
+                        diagnostics=optimization_diagnostics,
+                        now=now,
+                    )
+                else:
+                    reference = visibility_filter.apply(
+                        reference, target_state, observer_state,
+                        intervention_weight=intervention_weight, dt=filter_dt,
+                    )
+                visibility_filter_active = reference is not nominal_reference
+                original_reference_distance = reference_distance(nominal_reference, target_state, observer_state)
+                filtered_reference_distance = reference_distance(reference, target_state, observer_state)
             # psi_cmd = psi_prev + clip(wrap(psi_ref - psi_prev), +/- max_yaw_rate * dt)。
-            commanded_yaw = slew_yaw(commanded_yaw, reference.yaw, args.max_yaw_rate * (now - last_yaw_at))
-            last_yaw_at = now
-            reference = replace(reference, yaw=commanded_yaw)
             shadow_command = None
             if pbvs is not None:
                 # PBVS 仅记录候选速度，不参与下方实际下发的 V0 CommandData。
@@ -680,9 +1172,21 @@ def main() -> int:
                     "reference_p": reference.p,
                     "reference_v": reference.v,
                     "reference_a": reference.a,
+                    "visual_tracking_mode": args.visual_tracking_mode,
+                    **({"nominal_reference_p": nominal_reference.p, "v_nom": nominal_reference.v,
+                        "v_cmd": reference.v, "delta_v": tuple(reference.v[axis] - nominal_reference.v[axis]
+                                                                 for axis in range(3))}
+                       if args.visual_tracking_mode != "legacy" else {}),
                     "target_p": truth.p, "target_v": truth.v,
                     "target_a": target_message.reference_a,
                     "target_acceleration_source": "trajectory_reference_not_measured",
+                    "estimated_relative_position": tuple(
+                        state_estimate.p[axis] - link.shared_position[axis] for axis in range(3)
+                    ),
+                    "estimated_relative_velocity": tuple(
+                        state_estimate.v[axis] - link.odom.v[axis] for axis in range(3)
+                    ),
+                    "estimated_target_acceleration": state_estimate.a,
                     "observer_shared_p": link.shared_position,
                     "relative_position": relative_position,
                     "relative_velocity": relative_velocity,
@@ -690,6 +1194,12 @@ def main() -> int:
                     "prediction_horizon": args.prediction_horizon,
                     "horizontal_distance": distance,
                     "distance_band_violation": band_violation,
+                    "predicted_max_image_error": predicted_max_image_error,
+                    "visibility_intervention_weight": intervention_weight,
+                    "visibility_filter_active": visibility_filter_active,
+                    **optimization_diagnostics,
+                    "original_reference_distance": original_reference_distance,
+                    "filtered_reference_distance": filtered_reference_distance,
                     "desired_roll": controller.debug.roll,
                     "desired_pitch": controller.debug.pitch,
                     "desired_yaw": reference.yaw,
@@ -801,7 +1311,7 @@ def main() -> int:
                     flush=True,
                 )
                 next_status = now + args.status_period
-            time.sleep(rate)
+            time.sleep(max(0.0, rate - (time.monotonic() - now)))
 
         record["samples"] = samples[:: max(1, len(samples) // 300)]
         record["target_samples"] = target_samples
@@ -847,8 +1357,41 @@ def main() -> int:
         return 1
     finally:
         record["control_samples"] = control_samples
+        optimized_samples = [sample for sample in control_samples if "fov_candidate_feasible" in sample]
+        record["visibility_control"] = {
+            "enabled": args.visibility_optimization,
+            "pixel_source": "ideal_state_projection_not_image_detection",
+            "optimization_sample_count": len(optimized_samples),
+            "infeasible_sample_count": sum(not sample["fov_candidate_feasible"] for sample in optimized_samples),
+            "motion_infeasible_sample_count": sum(not sample["motion_constraints_feasible"]
+                                                  for sample in optimized_samples),
+            "separation_infeasible_sample_count": sum(not sample["separation_constraints_feasible"]
+                                                      for sample in optimized_samples),
+            "separation_min_m": args.visibility_separation_min,
+            "separation_scope": "horizontal_constant_target_acceleration_with_jerk_and_response_reserve",
+            "guaranteed_separation": False,
+            "optimizer": "joint_acceleration_lattice_receding_horizon",
+            "weights": {name: getattr(args, f"visibility_{name}_weight") for name in (
+                "fov", "distance", "tracking", "pixel_center", "pixel_rate", "terminal", "effort", "smoothness")},
+            "attitude_response_time_s": args.visibility_attitude_response_time,
+            "motion_lead_time_s": args.visibility_motion_lead_time,
+            "catchup_speed_limit_m_s": args.max_correction_speed,
+            "min_local_height_m": args.visibility_min_height,
+            "max_vertical_speed_m_s": args.visibility_max_vertical_speed,
+            "optimizer_elapsed_mean_ms": (sum(sample["optimizer_elapsed_ms"] for sample in optimized_samples)
+                                          / len(optimized_samples) if optimized_samples else None),
+            "optimizer_elapsed_max_ms": (max(sample["optimizer_elapsed_ms"] for sample in optimized_samples)
+                                         if optimized_samples else None),
+            "guaranteed_visible": False,
+            "target_acceleration_source": "trajectory_reference_proxy_not_measured",
+        }
         if visibility_diagnostics is not None:
             record["visibility_samples"] = visibility_samples
+        if args.visual_tracking_mode != "legacy":
+            distance_band = ((visibility_filter.min_distance, visibility_filter.max_distance)
+                             if visibility_filter is not None else (5.0, 10.0))
+            record["velocity_follower_comparison"] = summarize_velocity_follower(
+                record, args.pixel_velocity_params, distance_band)
         if samples and "samples" not in record:
             record["samples"] = samples[:: max(1, len(samples) // 300)]
         if target_samples and "target_samples" not in record:
@@ -878,6 +1421,18 @@ def main() -> int:
             print(f"PLOT: {plot_path}；归档: {record['picture_plot']}")
         elif not record.get("samples"):
             print("PLOT SKIPPED: tracker 未进入跟踪采样阶段，没有可绘制的响应数据；请检查 FAIL/INTERRUPT。", file=sys.stderr)
+        if control_samples:
+            try:
+                nine_state_path = plot_tracker_nine_state(
+                    control_samples, output_dir / "nine_state_response.png", args.state_source
+                )
+                record["nine_state_plot"] = nine_state_path.name
+                (output_dir / "run.json").write_text(
+                    json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+                )
+                print(f"NINE-STATE PLOT: {nine_state_path}")
+            except Exception as error:
+                print(f"NINE-STATE PLOT FAILED (raw samples retained): {error}", file=sys.stderr)
         if args.pbvs_shadow and control_samples:
             try:
                 shadow_plot = output_dir / "pbvs_shadow_response.png"
@@ -894,6 +1449,8 @@ def main() -> int:
             except Exception as error:
                 print(f"VISIBILITY EXPORT FAILED (raw samples retained): {error}", file=sys.stderr)
         subscriber.close()
+        if image_subscriber is not None:
+            image_subscriber.close()
         link.close()
         print(f"LOG: {output_dir}")
 

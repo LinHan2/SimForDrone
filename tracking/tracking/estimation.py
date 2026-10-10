@@ -56,6 +56,7 @@ class RelativeEkfTargetEstimator:
     def __init__(self, filter_: MetricRelativeTargetEKF | RelativeTargetEKF | None = None) -> None:
         self._filter = filter_ if filter_ is not None else MetricRelativeTargetEKF()
         self.last_estimate: TargetState | None = None
+        self._last_position_timestamp: float | None = None
 
     @property
     def tuning(self) -> dict[str, float | None]:
@@ -82,6 +83,27 @@ class RelativeEkfTargetEstimator:
             frame = RelativePoseMeasurement(measurement.timestamp, relative_position,
                                             _rotate_body_z(target_attitude), measurement.stereo_range_m)
             estimate = self._filter.update(frame, observer_acceleration=observer.a)
+        self.last_estimate = TargetState(
+            p=_add(observer.p, estimate.relative_position),
+            v=_add(observer.v, estimate.relative_velocity),
+            a=estimate.target_acceleration,
+        )
+        self._last_position_timestamp = measurement.timestamp
+        return self.last_estimate
+
+    def update_without_position(
+        self, timestamp: float, target_attitude: Quaternion, observer: ObserverKinematics,
+        *, max_position_age: float,
+    ) -> TargetState | None:
+        if self._last_position_timestamp is None:
+            return None
+        if timestamp - self._last_position_timestamp > max_position_age:
+            raise RuntimeError("EKF 位置量测连续缺失，停止跟踪")
+        if not isinstance(self._filter, MetricRelativeTargetEKF):
+            raise ValueError("缺位置预测仅支持九维米制 EKF")
+        estimate = self._filter.update(
+            MetricPoseMeasurement(timestamp, None, _rotate_body_z(target_attitude)), observer.a,
+        )
         self.last_estimate = TargetState(
             p=_add(observer.p, estimate.relative_position),
             v=_add(observer.v, estimate.relative_velocity),

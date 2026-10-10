@@ -1,3 +1,11 @@
+# 顺序实验入口
+
+`scripts/run_tracking_experiment.sh` 使用控制 venv 执行 `scripts/tracking_experiment.py`，
+读取 `tracking/config/experiment.yaml`，先启动 target，悬停后启动 tracker，首次 TRACK
+后创建本轮航迹放行文件。场景须通过 `start_dual_px4_scene.sh` 单独启动，编排器不启动或停止场景。
+编排器不打开 MAVLink 连接，
+14540/14541 仍由 target/tracker 独占。参数快照和进程输出归档到 `logs/experiments/`。
+
 # 项目调用关系整理
 
 本文回答一个问题：**从敲下命令到无人机动作，中间经过了哪些层、哪些文件、哪些进程。**

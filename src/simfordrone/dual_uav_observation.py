@@ -75,6 +75,8 @@ class DualUavObservationApp:
         self._create_vehicle("tracker", self.config["vehicles"]["tracker"], attach_camera=True)
 
         self.world.reset()
+        # 机载相机镜头由 Pegasus MonocularCamera.start() 按 YAML 内参写入，
+        # 使运行时 CameraInfo 与场景配置一致（fx=921，D435 等效）。
         # WebRTC 全局观察相机，仅供人眼查看；它不等于跟随机机载传感器。
         self.pg.set_viewport_camera(self.config["viewport"]["position"], self.config["viewport"]["target"])
         # UI 是否绘制：本地桌面（--gui）与“带 UI 的 WebRTC 流”都需要它；

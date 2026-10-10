@@ -225,10 +225,14 @@ def _flat_row(row: dict) -> dict:
         "t", "monotonic_s", "valid", "reason", "compute_ms", "target_age_sec", "odom_age_sec",
         "attitude_age_sec", "imu_age_sec", "predicted_fov_exit", "predicted_fov_exit_time_sec",
         "current_distance", "min_distance", "max_distance", "predicted_distance_at_horizon",
-        "max_image_error", "fov_cost", "distance_cost", "translation_mode_used", "attitude_mode_used",
+        "max_image_error", "fov_cost", "distance_cost", "pixel_occupancy_cost",
+        "translation_mode_used", "attitude_mode_used",
         "acceleration_fallback_reason",
     )}
     flat["distance_0p5_m"] = _anchor(row, "distances_pred", 0.5)
+    occupancies = row.get("pixel_occupancy_pred", [])
+    flat["pixel_occupancy_now_ratio"] = occupancies[0] if occupancies else None
+    flat["pixel_occupancy_0p5_ratio"] = _anchor(row, "pixel_occupancy_pred", 0.5)
     for mode in ("constant_attitude", "command_based_attitude"):
         projection = row.get("attitude_predictions", {}).get(mode, {})
         flat[f"{mode}_exit_sec"] = projection.get("predicted_fov_exit_time_sec")
@@ -300,7 +304,24 @@ def export_visibility(record: dict, output_dir: Path) -> list[Path]:
     image_path = output_dir / "visibility_prediction.png"
     figure.savefig(str(image_path), dpi=140)
     plt.close(figure)
-    return [csv_path, image_path]
+
+    occupancy_figure, occupancy_axis = plt.subplots(figsize=(12, 4))
+    occupancy_axis.axhspan(config.get("pixel_occupancy_min_ratio", 0.003),
+                           config.get("pixel_occupancy_max_ratio", 0.008),
+                           color="tab:green", alpha=0.15, label="Target occupancy band")
+    occupancy_axis.plot(times, column("pixel_occupancy_now_ratio"), label="Current projected area ratio")
+    occupancy_axis.plot([value + 0.5 for value in times], column("pixel_occupancy_0p5_ratio"), "--",
+                        label="Predicted +0.5s (time aligned)")
+    occupancy_axis.set_xlabel("Run time [s]")
+    occupancy_axis.set_ylabel("Projected target area / image area")
+    occupancy_axis.set_title("Pixel occupancy proxy (geometric target-size model, not detector output)")
+    occupancy_axis.grid(alpha=0.25)
+    occupancy_axis.legend(fontsize=8, loc="best")
+    occupancy_figure.tight_layout()
+    occupancy_path = output_dir / "pixel_occupancy.png"
+    occupancy_figure.savefig(str(occupancy_path), dpi=140)
+    plt.close(occupancy_figure)
+    return [csv_path, image_path, occupancy_path]
 
 
 def main() -> None:

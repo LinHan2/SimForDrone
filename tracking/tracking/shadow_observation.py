@@ -227,6 +227,27 @@ def project_oracle_pixel(
     return float(u), float(v), float(np.linalg.norm(target_optical))
 
 
+def world_to_camera_path(target_positions, tracker_positions, attitudes, camera_offset_body,
+                         camera_forward_sign=1.0):
+    """批量变换预测路径，复用单帧 ENU/FLU/光学坐标约定，避免逐帧重复旋转矩阵。"""
+    quaternions = np.asarray(attitudes, dtype=float)
+    vectors = np.asarray(target_positions, dtype=float) - np.asarray(tracker_positions, dtype=float)
+    if (quaternions.shape != (len(vectors), 4) or vectors.shape != (len(vectors), 3)
+            or not np.isfinite(quaternions).all() or not np.isfinite(vectors).all()
+            or camera_forward_sign not in (-1.0, 1.0)):
+        raise ValueError("相机路径尺寸、姿态或前向符号无效")
+    norms = np.linalg.norm(quaternions, axis=1, keepdims=True)
+    if np.any(norms <= 1e-6):
+        raise ValueError("姿态四元数不得为零")
+    quaternions = quaternions / norms
+    inverse_vector = -quaternions[:, :3]
+    cross = 2.0 * np.cross(inverse_vector, vectors)
+    body = (vectors + quaternions[:, 3:] * cross + np.cross(inverse_vector, cross)
+            - np.asarray(camera_offset_body, dtype=float))
+    return np.column_stack((-camera_forward_sign * body[:, 1], -body[:, 2],
+                            camera_forward_sign * body[:, 0]))
+
+
 def _rotation_matrix(attitude: tuple[float, float, float, float]) -> np.ndarray:
     columns = [rotate_vector(attitude, axis) for axis in ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))]
     return np.column_stack(columns)

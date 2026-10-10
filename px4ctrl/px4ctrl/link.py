@@ -244,6 +244,8 @@ class MavlinkLink:
                 self.odom.v = ned_to_enu_position(
                     (float(message.vx), float(message.vy), float(message.vz))
                 )
+                source_ms = getattr(message, "time_boot_ms", None)
+                self.odom.source_time = None if source_ms is None else float(source_ms) * 0.001
                 self.odom.recv_time = now
             elif kind == "GLOBAL_POSITION_INT":
                 latitude = float(message.lat) * 1e-7
